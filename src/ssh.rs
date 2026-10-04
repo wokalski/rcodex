@@ -185,7 +185,25 @@ impl Client {
             serde_json::from_slice(&out).context("decode remote directory")?;
         reply.map_err(anyhow::Error::msg)
     }
-    pub fn call(&self, request: Request) -> Result<Vec<Connection>> {
+    fn hostname(&self) -> Result<String> {
+        let config = checked(Command::new("ssh").args(["-G", &self.host]))?;
+        let config = String::from_utf8(config)?;
+        Ok(config
+            .lines()
+            .find_map(|l| l.strip_prefix("hostname "))
+            .context("SSH hostname missing")?
+            .trim_matches(['[', ']'])
+            .to_owned())
+    }
+    pub fn call(&self, mut request: Request) -> Result<Vec<Connection>> {
+        if let Request::Start {
+            direct: true,
+            server_name,
+            ..
+        } = &mut request
+        {
+            *server_name = Some(self.hostname()?);
+        }
         let command = format!(
             "{} __remote {}",
             self.helper,
@@ -204,18 +222,20 @@ impl Client {
                 conn.direct,
                 "server is loopback-only; reconnect without --direct"
             );
-            let config = checked(Command::new("ssh").args(["-G", &self.host]))?;
-            let config = String::from_utf8(config)?;
-            let host = config
-                .lines()
-                .find_map(|l| l.strip_prefix("hostname "))
-                .context("SSH hostname missing")?;
+            let certificate = conn.certificate.as_deref().context(
+                "this server uses legacy plaintext direct mode; reconnect without --direct, or launch a new TLS server"
+            )?;
+            let host = self.hostname()?;
+            crate::tls::check(&host, conn.port, certificate).with_context(|| format!(
+                "cannot reach direct TLS server at {host}:{}; check firewall/routing or reconnect without --direct. The remote server is still running",
+                conn.port
+            ))?;
             let host = if host.contains(':') && !host.starts_with('[') {
                 format!("[{host}]")
             } else {
                 host.to_owned()
             };
-            return Ok(format!("ws://{host}:{}", conn.port));
+            return Ok(format!("wss://{host}:{}", conn.port));
         }
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
@@ -229,7 +249,12 @@ impl Client {
             &format!("127.0.0.1:{port}:127.0.0.1:{}", conn.port),
             &self.host,
         ]))?;
-        Ok(format!("ws://127.0.0.1:{port}"))
+        let scheme = if conn.certificate.is_some() {
+            "wss"
+        } else {
+            "ws"
+        };
+        Ok(format!("{scheme}://127.0.0.1:{port}"))
     }
 }
 

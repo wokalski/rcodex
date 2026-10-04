@@ -29,6 +29,8 @@ pub struct Connection {
     pub port: u16,
     pub direct: bool,
     pub token: Option<String>,
+    #[serde(default)]
+    pub certificate: Option<String>,
     pub log: String,
     pub created: u64,
 }
@@ -36,8 +38,15 @@ pub struct Connection {
 #[serde(tag = "action", rename_all = "lowercase")]
 pub enum Request {
     List,
-    Start { path: String, direct: bool },
-    Stop { id: String },
+    Start {
+        path: String,
+        direct: bool,
+        #[serde(default)]
+        server_name: Option<String>,
+    },
+    Stop {
+        id: String,
+    },
 }
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
@@ -193,9 +202,15 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
             }
             fs::remove_file(file)?;
             let _ = fs::remove_file(conns.join(format!("{id}.token")));
+            let _ = fs::remove_file(conns.join(format!("{id}.pem")));
+            let _ = fs::remove_file(conns.join(format!("{id}.key")));
             Ok(vec![])
         }
-        Request::Start { path, direct } => {
+        Request::Start {
+            path,
+            direct,
+            server_name,
+        } => {
             let path = if path == "~" {
                 home
             } else if let Some(p) = path.strip_prefix("~/") {
@@ -214,32 +229,54 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
             let id = Uuid::new_v4().simple().to_string();
             let log = logs.join(format!("{id}.log"));
             let token_file = conns.join(format!("{id}.token"));
+            let cert_file = conns.join(format!("{id}.pem"));
+            let key_file = conns.join(format!("{id}.key"));
             let token =
                 direct.then(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
             if let Some(token) = &token {
                 private_write(&token_file, token.as_bytes())?;
             }
             let result = (|| -> Result<Vec<Connection>> {
+                let certificate = if direct {
+                    let name =
+                        server_name.context("direct mode needs an SSH-resolved server name")?;
+                    let certified = rcgen::generate_simple_self_signed(vec![
+                        name,
+                        "localhost".into(),
+                        "127.0.0.1".into(),
+                    ])?;
+                    let certificate = certified.cert.pem();
+                    private_write(&cert_file, certificate.as_bytes())?;
+                    private_write(&key_file, certified.signing_key.serialize_pem().as_bytes())?;
+                    Some(certificate)
+                } else {
+                    None
+                };
                 let output = OpenOptions::new()
                     .create_new(true)
                     .write(true)
                     .mode(0o600)
                     .open(&log)?;
                 let mut cmd = Command::new("nohup");
-                cmd.args([
-                    "codex",
-                    "app-server",
-                    "--listen",
-                    &format!("ws://{host}:{port}"),
-                ])
-                .current_dir(&path)
-                .stdin(Stdio::null())
-                .stderr(output.try_clone()?)
-                .stdout(output);
                 if direct {
-                    cmd.args(["--ws-auth", "capability-token", "--ws-token-file"])
-                        .arg(&token_file);
+                    cmd.arg(env::current_exe()?)
+                        .arg("__tls")
+                        .arg(port.to_string())
+                        .arg(&token_file)
+                        .arg(&cert_file)
+                        .arg(&key_file);
+                } else {
+                    cmd.args([
+                        "codex",
+                        "app-server",
+                        "--listen",
+                        &format!("ws://{host}:{port}"),
+                    ]);
                 }
+                cmd.current_dir(&path)
+                    .stdin(Stdio::null())
+                    .stderr(output.try_clone()?)
+                    .stdout(output);
                 unsafe {
                     cmd.pre_exec(|| {
                         nix::unistd::setsid().map_err(std::io::Error::from)?;
@@ -255,6 +292,7 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
                     port,
                     direct,
                     token,
+                    certificate,
                     log: log.to_string_lossy().into(),
                     created: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
                 };
@@ -297,6 +335,8 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
             })();
             if result.is_err() {
                 let _ = fs::remove_file(token_file);
+                let _ = fs::remove_file(cert_file);
+                let _ = fs::remove_file(key_file);
             }
             result
         }
@@ -354,6 +394,7 @@ mod tests {
             port: 1234,
             direct: false,
             token: None,
+            certificate: None,
             log: "log".into(),
             created: 0,
         };
@@ -387,7 +428,8 @@ mod tests {
             handle_at(
                 Request::Start {
                     path: dir.path().join("missing").to_string_lossy().into(),
-                    direct: false
+                    direct: false,
+                    server_name: None,
                 },
                 dir.path().into(),
                 dir.path().into()

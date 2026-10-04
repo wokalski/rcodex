@@ -20,18 +20,44 @@ fn call(root: &std::path::Path, request: Value) -> Value {
     assert!(response["error"].is_null(), "{response}");
     response["rows"].clone()
 }
-fn handshake(port: u64, token: Option<&str>) -> String {
-    let mut socket = TcpStream::connect(("127.0.0.1", port as u16)).unwrap();
+fn handshake(
+    port: u64,
+    token: Option<&str>,
+    certificate: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
+    trait Socket: Read + Write {}
+    impl<T: Read + Write> Socket for T {}
+    let socket = TcpStream::connect(("127.0.0.1", port as u16))?;
     socket
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
+    let mut socket: Box<dyn Socket> = if let Some(certificate) = certificate {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from_pem_slice(certificate.as_bytes())?)?;
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Box::new(rustls::StreamOwned::new(
+            rustls::ClientConnection::new(
+                std::sync::Arc::new(config),
+                ServerName::try_from("localhost")?,
+            )?,
+            socket,
+        ))
+    } else {
+        Box::new(socket)
+    };
     let auth = token
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
         .unwrap_or_default();
-    write!(socket,"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{auth}\r\n").unwrap();
+    write!(
+        socket,
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{auth}\r\n"
+    )?;
     let mut buffer = [0; 2048];
-    let n = socket.read(&mut buffer).unwrap();
-    String::from_utf8_lossy(&buffer[..n]).into_owned()
+    let n = socket.read(&mut buffer)?;
+    Ok(String::from_utf8_lossy(&buffer[..n]).into_owned())
 }
 #[test]
 #[ignore = "requires codex app-server on PATH"]
@@ -41,7 +67,10 @@ fn real_codex_persists_lists_authenticates_and_stops() {
         let root = tmp.path().join("state");
         let path = tmp.path().join("project ' with spaces 日本語");
         fs::create_dir(&path).unwrap();
-        let rows = call(&root, json!({"action":"start","path":path,"direct":direct}));
+        let rows = call(
+            &root,
+            json!({"action":"start","path":path,"direct":direct,"server_name":"localhost"}),
+        );
         let c = &rows[0];
         let id = c["id"].as_str().unwrap();
         let port = c["port"].as_u64().unwrap();
@@ -54,11 +83,40 @@ fn real_codex_persists_lists_authenticates_and_stops() {
             assert_eq!(call(&root, json!({"action":"list"}))[0]["id"], id);
             let metadata = fs::metadata(root.join("conns").join(format!("{id}.json"))).unwrap();
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            let certificate = c["certificate"].as_str();
             if direct {
-                assert!(handshake(port, None).starts_with("HTTP/1.1 401"));
-                assert!(handshake(port, Some("incorrect-token")).starts_with("HTTP/1.1 401"));
+                assert!(certificate.is_some());
+                assert!(
+                    handshake(port, None, certificate)
+                        .unwrap()
+                        .starts_with("HTTP/1.1 401")
+                );
+                assert!(
+                    handshake(port, Some("incorrect-token"), certificate)
+                        .unwrap()
+                        .starts_with("HTTP/1.1 401")
+                );
+                let wrong = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+                assert!(handshake(port, c["token"].as_str(), Some(&wrong.cert.pem())).is_err());
+                assert!(
+                    !handshake(port, c["token"].as_str(), None)
+                        .unwrap_or_default()
+                        .starts_with("HTTP/1.1 101")
+                );
+                assert_eq!(
+                    fs::metadata(root.join("conns").join(format!("{id}.key")))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
             }
-            assert!(handshake(port, c["token"].as_str()).starts_with("HTTP/1.1 101"));
+            assert!(
+                handshake(port, c["token"].as_str(), certificate)
+                    .unwrap()
+                    .starts_with("HTTP/1.1 101")
+            );
         });
         call(&root, json!({"action":"stop","id":id}));
         assert!(
@@ -69,6 +127,8 @@ fn real_codex_persists_lists_authenticates_and_stops() {
         );
         assert!(TcpStream::connect(("127.0.0.1", port as u16)).is_err());
         assert!(!root.join("conns").join(format!("{id}.token")).exists());
+        assert!(!root.join("conns").join(format!("{id}.key")).exists());
+        assert!(!root.join("conns").join(format!("{id}.pem")).exists());
         if let Err(e) = result {
             std::panic::resume_unwind(e);
         }

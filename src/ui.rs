@@ -90,6 +90,7 @@ impl App {
                     return Action::Remote(Request::Start {
                         path: self.directory.path.clone(),
                         direct,
+                        server_name: None,
                     });
                 }
                 KeyCode::Left => {
@@ -449,6 +450,7 @@ mod tests {
                     port: 43127,
                     direct: false,
                     token: None,
+                    certificate: None,
                     log: "log".into(),
                     created: 0,
                 },
@@ -460,6 +462,7 @@ mod tests {
                     port: 39841,
                     direct: true,
                     token: None,
+                    certificate: None,
                     log: "log".into(),
                     created: 0,
                 },
@@ -525,7 +528,7 @@ mod tests {
             matches!(app.key(KeyCode::Enter.into(), false), Action::Browse(path) if path == "/projects/alpha")
         );
         assert!(
-            matches!(app.key(KeyCode::Char(' ').into(), true), Action::Remote(Request::Start {path, direct:true}) if path == "/projects")
+            matches!(app.key(KeyCode::Char(' ').into(), true), Action::Remote(Request::Start {path, direct:true, ..}) if path == "/projects")
         );
         assert!(
             matches!(app.key(KeyCode::Left.into(), false), Action::Browse(path) if path == "/")

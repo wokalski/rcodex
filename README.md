@@ -61,19 +61,36 @@ there is no matching history in the selected project.
 
 Normal mode binds the server to `127.0.0.1` and forwards a local loopback port over SSH. Existing SSH aliases, keys, agents, and ProxyJump configuration work through the system `ssh`. One SSH control connection is reused for setup, management, and forwarding. A small detached watcher removes that connection after the local Codex process exits, including abnormal exits.
 
-`--direct` binds the remote server to **0.0.0.0**, authenticates with a random bearer token, and connects to the SSH-configured hostname. **WebSocket traffic and the token are unencrypted. Use a trusted network such as Tailscale, or use the default SSH tunnel.** You must make the selected remote port reachable yourself; rcodex does not change firewalls. A loopback-only server cannot be reconnected to with `--direct`; launch a new direct server instead. A direct server can also be accessed through the default tunnel.
+`--direct` uses **encrypted `wss://`** with a random bearer token. A small per-server
+TLS relay binds to **0.0.0.0**, while Codex itself listens on loopback. The server
+generates a private certificate; rcodex retrieves its public certificate over SSH,
+verifies the direct endpoint, and supplies a temporary CA bundle to the local
+Codex process. No system trust store, reverse proxy, or Tailscale configuration is
+changed. Native/configured CA roots are retained in that bundle.
+
+The SSH-configured hostname and selected remote port must be reachable; rcodex
+does not change firewalls. Failed reachability checks leave the server running
+and explain how to reconnect through SSH. A loopback-only server cannot be used
+with `--direct`; launch a new direct server instead. Direct TLS servers can also
+be accessed through the default SSH tunnel.
+
+Servers created by older rcodex builds used plaintext direct WebSockets, which
+Codex rejects with a bearer token. Reconnect to those without `--direct` to keep
+working, or launch a new server for TLS. Running servers are never automatically
+restarted during an upgrade.
 
 ## Remote state
 
 ```text
 ~/.cache/rcodex/<binary-hash>       cached helper (uploaded once per build)
-~/.local/state/rcodex/conns/       private JSON records and direct-mode tokens
+~/.local/state/rcodex/conns/       private records, tokens, TLS certificates and keys
 ~/.local/state/rcodex/logs/        one log per app-server
 ```
 
 Servers run under `nohup` in a new session with stdin disconnected. Records include the process start time and boot ID, so stale records do not identify unrelated processes after PID reuse or reboot. Inactive records are omitted from the picker; stopped records and tokens are removed, while logs are retained.
 
-No resident rcodex daemon is required. Servers survive SSH disconnects, but are
+No shared rcodex daemon is required; direct mode runs one TLS relay per server.
+Servers survive SSH disconnects, but are
 not automatically restarted after a crash or reboot.
 
 Set `RCODEX_STATE_DIR` in the **remote noninteractive shell environment** to use another absolute state path, e.g. `/var/lib/rcodex`. It must be writable by the SSH user. The default needs no root access.

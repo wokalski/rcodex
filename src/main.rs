@@ -1,5 +1,6 @@
 mod remote;
 mod ssh;
+mod tls;
 mod ui;
 
 use anyhow::{Context, Result, bail};
@@ -20,7 +21,7 @@ struct Args {
     ssh_address: String,
     /// Existing remote project directory (omit to open the workspace picker)
     path: Option<String>,
-    /// Connect with authenticated, unencrypted WebSockets; trusted networks only
+    /// Connect directly using TLS authenticated through SSH (no SSH data tunnel)
     #[arg(long)]
     direct: bool,
     /// Resume a remote conversation (omit the ID to open Codex's session picker)
@@ -40,6 +41,10 @@ fn main() {
 
 fn run() -> Result<()> {
     let raw: Vec<String> = env::args().collect();
+    if raw.get(1).map(String::as_str) == Some("__tls") {
+        anyhow::ensure!(raw.len() == 6, "invalid TLS helper arguments");
+        return tls::serve(raw[2].parse()?, &raw[3], &raw[4], &raw[5]);
+    }
     if raw.get(1).map(String::as_str) == Some("__browse") {
         let result = raw
             .get(2)
@@ -88,9 +93,6 @@ fn run() -> Result<()> {
         .status()
         .context("install Codex locally first")?;
     anyhow::ensure!(status.success(), "local codex --version failed");
-    if args.direct {
-        eprintln!("Direct ws:// is unencrypted. Use only on a trusted network such as Tailscale.");
-    }
     let client = ssh::Client::connect(args.ssh_address)?;
     let pid = std::process::id();
     let start = remote::identity(pid).context("cannot identify local process")?;
@@ -122,6 +124,7 @@ fn run() -> Result<()> {
             .call(remote::Request::Start {
                 path,
                 direct: args.direct,
+                server_name: None,
             })?
             .into_iter()
             .next()
@@ -132,8 +135,13 @@ fn run() -> Result<()> {
         return Ok(());
     };
     let endpoint = client.endpoint(&selected, args.direct)?;
-    Err(codex_command(&endpoint, &selected, args.resume.as_deref(), args.last).exec())
-        .context("launch local Codex")
+    let mut command = codex_command(&endpoint, &selected, args.resume.as_deref(), args.last);
+    if let Some(certificate) = &selected.certificate {
+        let roots = client.directory().join("roots.pem");
+        tls::write_roots(&roots, certificate)?;
+        command.env("SSL_CERT_FILE", roots);
+    }
+    Err(command.exec()).context("launch local Codex")
 }
 
 fn codex_command(
@@ -175,6 +183,7 @@ mod tests {
             port: 1234,
             direct: true,
             token: Some("test-token".into()),
+            certificate: None,
             log: "log".into(),
             created: 0,
         };
