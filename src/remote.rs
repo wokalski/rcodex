@@ -88,20 +88,35 @@ pub fn identity(pid: u32) -> Option<String> {
     fields.get(19).map(|s| format!("{}:{s}", boot.trim()))
 }
 #[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {}
+
+#[cfg(target_os = "macos")]
 pub fn identity(pid: u32) -> Option<String> {
-    let output = Command::new("/bin/ps")
-        .env("LC_ALL", "C")
-        .args(["-p", &pid.to_string(), "-o", "stat=", "-o", "lstart="])
-        .output()
-        .ok()?;
-    let text = String::from_utf8(output.stdout).ok()?;
-    let mut fields = text.split_whitespace();
-    let state = fields.next()?;
-    if !output.status.success() || state.starts_with('Z') {
+    use nix::libc::{PROC_PIDTBSDINFO, SZOMB, proc_bsdinfo, proc_pidinfo};
+    let mut info = std::mem::MaybeUninit::<proc_bsdinfo>::uninit();
+    let size = std::mem::size_of::<proc_bsdinfo>() as i32;
+    // proc_pidinfo writes the entire struct only when it returns its full size.
+    let written = unsafe {
+        proc_pidinfo(
+            pid.try_into().ok()?,
+            PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if written != size {
         return None;
     }
-    let start = fields.collect::<Vec<_>>().join(" ");
-    (!start.is_empty()).then_some(start)
+    let info = unsafe { info.assume_init() };
+    if info.pbi_status == SZOMB {
+        return None;
+    }
+    Some(format!(
+        "{}:{}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
 }
 impl Connection {
     pub fn active(&self) -> bool {
@@ -291,6 +306,19 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn identity_tracks_a_child_until_exit() {
+        let mut child = Command::new("sh")
+            .args(["-c", "read value"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let before = identity(child.id()).expect("identify running child");
+        assert_eq!(identity(child.id()).as_deref(), Some(before.as_str()));
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        assert!(identity(child.id()).is_none());
+    }
     #[test]
     fn browse_lists_only_directories_and_follows_directory_links() {
         let dir = tempfile::tempdir().unwrap();
