@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
-    io::Write,
+    io::{IsTerminal, Write},
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -51,6 +51,16 @@ fn checked(cmd: &mut Command) -> Result<Vec<u8>> {
     );
     Ok(out.stdout)
 }
+fn helper_binary() -> Result<Vec<u8>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(include_bytes!("../bin/rcodex-linux-x86_64").to_vec())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(fs::read(env::current_exe()?)?)
+    }
+}
 impl Client {
     pub fn control(&self) -> PathBuf {
         self.directory().join("ssh")
@@ -65,7 +75,7 @@ impl Client {
     }
     pub fn connect(host: String) -> Result<Self> {
         let dir = tempfile::Builder::new().prefix("rcodex-").tempdir()?;
-        let exe = fs::read(env::current_exe()?)?;
+        let exe = helper_binary()?;
         let hash = format!("{:x}", Sha256::digest(&exe));
         let client = Self {
             host: host.clone(),
@@ -89,12 +99,58 @@ impl Client {
         ensure!(status.success(), "could not connect to {}", client.host);
         Ok(client)
     }
+    pub fn ensure_login(&self) -> Result<()> {
+        let check = "command -v codex >/dev/null || exit 127; codex login status";
+        let status = self
+            .ssh()
+            .args([&self.host, check])
+            .output()
+            .context("check remote Codex login")?;
+        if status.status.success() {
+            return Ok(());
+        }
+        ensure!(
+            status.status.code() != Some(127),
+            "install Codex on the remote host first (codex must be on its noninteractive shell PATH)"
+        );
+        ensure!(
+            status.status.code() == Some(1),
+            "remote Codex login check failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        eprintln!(
+            "Codex is not logged in on {}. Complete the device login below.",
+            self.host
+        );
+        let mut login = self.ssh();
+        if std::io::stdin().is_terminal() {
+            login.arg("-t");
+        }
+        let status = login
+            .args([&self.host, "codex login --device-auth"])
+            .status()
+            .context("run remote Codex login")?;
+        ensure!(
+            status.success(),
+            "remote Codex login failed or was cancelled; no server was started"
+        );
+        let status = self.ssh().args([&self.host, check]).output()?;
+        ensure!(
+            status.status.success(),
+            "remote Codex is still not authenticated; no server was started"
+        );
+        Ok(())
+    }
     pub fn install(&self) -> Result<()> {
         let platform = checked(self.ssh().args([&self.host, "uname -sm"]))?;
         let platform = String::from_utf8(platform)?;
-        let arch = env::consts::ARCH;
+        let arch = if cfg!(target_os = "macos") {
+            "x86_64"
+        } else {
+            env::consts::ARCH
+        };
         ensure!(
-            env::consts::OS == "linux" && platform.trim() == format!("Linux {arch}"),
+            platform.trim() == format!("Linux {arch}"),
             "this build needs a Linux/{arch} remote, got {}",
             platform.trim()
         );
@@ -117,7 +173,7 @@ impl Client {
             .args([&self.host, &script])
             .stdin(Stdio::piped())
             .spawn()?;
-        let data = fs::read(env::current_exe()?)?;
+        let data = helper_binary()?;
         child.stdin.take().context("SSH stdin")?.write_all(&data)?;
         ensure!(child.wait()?.success(), "could not install remote helper");
         Ok(())

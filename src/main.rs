@@ -109,6 +109,7 @@ fn run() -> Result<()> {
         });
     }
     watcher.spawn().context("start tunnel cleanup watcher")?;
+    client.ensure_login()?;
     client.install()?;
     let selected = if let Some(path) = args.path {
         client

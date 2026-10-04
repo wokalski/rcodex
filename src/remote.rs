@@ -76,6 +76,7 @@ pub fn browse(path: &str) -> Result<Directory> {
     })
 }
 
+#[cfg(not(target_os = "macos"))]
 pub fn identity(pid: u32) -> Option<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_, fields) = stat.rsplit_once(')')?;
@@ -85,6 +86,22 @@ pub fn identity(pid: u32) -> Option<String> {
     }
     let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     fields.get(19).map(|s| format!("{}:{s}", boot.trim()))
+}
+#[cfg(target_os = "macos")]
+pub fn identity(pid: u32) -> Option<String> {
+    let output = Command::new("/bin/ps")
+        .env("LC_ALL", "C")
+        .args(["-p", &pid.to_string(), "-o", "stat=", "-o", "lstart="])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut fields = text.split_whitespace();
+    let state = fields.next()?;
+    if !output.status.success() || state.starts_with('Z') {
+        return None;
+    }
+    let start = fields.collect::<Vec<_>>().join(" ");
+    (!start.is_empty()).then_some(start)
 }
 impl Connection {
     pub fn active(&self) -> bool {

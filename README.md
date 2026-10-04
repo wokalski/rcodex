@@ -37,9 +37,9 @@ The directory must already exist. Each launch starts a separate server; reconnec
 
 ## Requirements and transport
 
-- Currently **Linux on both ends, with matching CPU architecture**. The supplied build is x86-64. The helper checks architecture before uploading.
+- Clients: **macOS (Apple Silicon or Intel)** and **x86-64 Linux**. Remote servers: **x86-64 Linux**. The macOS binary embeds a static Linux helper; no remote build tools or Rosetta are needed. Other remote architectures are not yet supported by the macOS client.
 - OpenSSH locally; SSH access, `nohup`, and a recent `codex` on the remote noninteractive shell's `PATH`.
-- Local Codex must support `--remote`; direct mode additionally requires app-server capability-token authentication. Tested with Codex **0.160.0**. Sign in to Codex on the remote host before model use.
+- Local Codex must support `--remote`; direct mode additionally requires app-server capability-token authentication. Tested with Codex **0.160.0**. Before opening the picker or starting a server, rcodex checks remote login and runs `codex login --device-auth` over SSH if needed. Open the displayed URL in your browser and approve the device code. Failed or cancelled login stops the launch. Device-code login must be enabled in your ChatGPT account settings.
 - No Rust toolchain, Python, Node, Go, or shared libraries are required to run the static build remotely.
 
 Normal mode binds the server to `127.0.0.1` and forwards a local loopback port over SSH. Existing SSH aliases, keys, agents, and ProxyJump configuration work through the system `ssh`. One SSH control connection is reused for setup, management, and forwarding. A small detached watcher removes that connection after the local Codex process exits, including abnormal exits.
@@ -63,7 +63,7 @@ Set `RCODEX_STATE_DIR` in the **remote noninteractive shell environment** to use
 
 ## Build and verify
 
-On x86-64 Linux with Nix flakes enabled:
+On macOS or x86-64 Linux with Nix flakes enabled:
 
 ```sh
 nix run github:wokalski/rcodex -- user@host
@@ -71,8 +71,9 @@ nix run github:wokalski/rcodex -- user@host
 nix profile add github:wokalski/rcodex
 ```
 
-The Nix package builds a static binary; Codex and OpenSSH must already be on
-your PATH. To build from a checkout, run `nix build` and use `result/bin/rcodex`.
+The Nix package builds a native macOS client or static Linux binary; Codex and
+OpenSSH must already be on your PATH. To build from a checkout, run `nix build`
+and use `result/bin/rcodex`.
 
 With Rust and a musl C toolchain (e.g. `musl-tools` on Debian/Ubuntu):
 
@@ -89,4 +90,6 @@ cargo clippy --all-targets -- -D warnings
 cargo test --test remote_lifecycle -- --ignored
 ```
 
-For a native development build, use `cargo build`. A dynamically linked build is only portable to remote hosts with the matching loader and libraries; use the musl release for distribution.
+For a native development build, use `cargo build`. On macOS this embeds the
+checked-in Linux helper. On Linux a dynamically linked build is only portable
+to remote hosts with the matching loader and libraries; use musl for distribution.
