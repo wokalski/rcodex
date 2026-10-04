@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     env,
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     net::{TcpListener, TcpStream},
     os::unix::{
         fs::{DirBuilderExt, OpenOptionsExt},
@@ -23,6 +23,8 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Connection {
     pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
     pub path: String,
     pub pid: u32,
     pub start: String,
@@ -43,9 +45,15 @@ pub enum Request {
         direct: bool,
         #[serde(default)]
         server_name: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
     },
     Stop {
         id: String,
+    },
+    Rename {
+        id: String,
+        name: String,
     },
 }
 #[derive(Serialize, Deserialize)]
@@ -83,6 +91,89 @@ pub fn browse(path: &str) -> Result<Directory> {
         path: path.to_str().context("directory path is not UTF-8")?.into(),
         folders,
     })
+}
+
+pub fn mkdir(parent: &str, name: &str) -> Result<Directory> {
+    ensure!(
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name.contains('/')
+            && !name.chars().any(char::is_control),
+        "enter a folder name, not a path"
+    );
+    let parent = PathBuf::from(parent)
+        .canonicalize()
+        .context("open parent directory")?;
+    let path = parent.join(name);
+    fs::create_dir(&path).context("create folder (existing folders are not overwritten)")?;
+    browse(path.to_str().context("directory path is not UTF-8")?)
+}
+
+pub fn clean_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+        .collect()
+}
+
+fn validate_id(id: &str) -> Result<()> {
+    ensure!(
+        id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit()),
+        "invalid connection ID"
+    );
+    Ok(())
+}
+
+fn normalized_name(name: &str) -> Result<Option<String>> {
+    ensure!(
+        !name.chars().any(char::is_control),
+        "names cannot contain control characters"
+    );
+    let name = name.trim();
+    ensure!(
+        name.chars().count() <= 80,
+        "names must be at most 80 characters"
+    );
+    Ok((!name.is_empty()).then(|| name.to_owned()))
+}
+
+fn state_dir(home: &std::path::Path) -> Result<PathBuf> {
+    let root = env::var_os("RCODEX_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/state/rcodex"));
+    ensure!(root.is_absolute(), "RCODEX_STATE_DIR must be absolute");
+    Ok(root)
+}
+
+pub fn logs(id: &str, lines: usize) -> Result<String> {
+    let home = PathBuf::from(env::var("HOME").context("HOME is unset")?);
+    logs_at(&state_dir(&home)?, id, lines)
+}
+
+fn logs_at(root: &std::path::Path, id: &str, lines: usize) -> Result<String> {
+    validate_id(id)?;
+    ensure!(
+        (1..=2000).contains(&lines),
+        "log lines must be between 1 and 2000"
+    );
+    let mut file =
+        fs::File::open(root.join("logs").join(format!("{id}.log"))).context("open server log")?;
+    // Never load an unbounded log into either the helper or the terminal.
+    let offset = file.metadata()?.len().saturating_sub(128 * 1024);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.take(128 * 1024).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = if offset > 0 {
+        text.split_once('\n')
+            .map_or(text.as_ref(), |(_, tail)| tail)
+    } else {
+        &text
+    };
+    let tail: Vec<_> = text.lines().rev().take(lines).collect();
+    Ok(clean_text(
+        &tail.into_iter().rev().collect::<Vec<_>>().join("\n"),
+    ))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -128,6 +219,15 @@ pub fn identity(pid: u32) -> Option<String> {
     ))
 }
 impl Connection {
+    pub fn label(&self) -> &str {
+        self.name.as_deref().unwrap_or_else(|| {
+            std::path::Path::new(&self.path)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&self.path)
+        })
+    }
+
     pub fn active(&self) -> bool {
         !self.start.is_empty() && identity(self.pid).as_deref() == Some(&self.start)
     }
@@ -149,10 +249,7 @@ fn terminate(c: &Connection, signal: Signal) -> Result<()> {
 }
 pub fn handle(request: Request) -> Result<Vec<Connection>> {
     let home = PathBuf::from(env::var("HOME").context("HOME is unset")?);
-    let root = env::var_os("RCODEX_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/state/rcodex"));
-    ensure!(root.is_absolute(), "RCODEX_STATE_DIR must be absolute");
+    let root = state_dir(&home)?;
     handle_at(request, root, home)
 }
 fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Connection>> {
@@ -164,6 +261,14 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
             .mode(0o700)
             .create(dir)?;
     }
+    // A stable lock serializes atomic record replacement with stop/removal.
+    let registry_lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(root.join("registry.lock"))?;
+    registry_lock.lock()?;
     match request {
         Request::List => {
             let mut rows = vec![];
@@ -178,14 +283,28 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
                     rows.push(c);
                 }
             }
-            rows.sort_by(|a, b| a.path.cmp(&b.path).then(a.created.cmp(&b.created)));
+            rows.sort_by(|a, b| {
+                a.path
+                    .cmp(&b.path)
+                    .then(a.created.cmp(&b.created))
+                    .then(a.id.cmp(&b.id))
+            });
             Ok(rows)
         }
+        Request::Rename { id, name } => {
+            validate_id(&id)?;
+            let name = normalized_name(&name)?;
+            let file = conns.join(format!("{id}.json"));
+            let mut c: Connection = serde_json::from_slice(&fs::read(&file)?)?;
+            ensure!(c.active(), "server is no longer running");
+            c.name = name;
+            let mut temp = tempfile::NamedTempFile::new_in(&conns)?;
+            temp.write_all(&serde_json::to_vec(&c)?)?;
+            temp.persist(&file)?;
+            Ok(vec![c])
+        }
         Request::Stop { id } => {
-            ensure!(
-                id.len() == 32 && id.bytes().all(|c| c.is_ascii_hexdigit()),
-                "invalid connection ID"
-            );
+            validate_id(&id)?;
             let file = conns.join(format!("{id}.json"));
             let c: Connection = serde_json::from_slice(&fs::read(&file)?)?;
             if c.active() {
@@ -210,7 +329,9 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
             path,
             direct,
             server_name,
+            name,
         } => {
+            let name = name.as_deref().map(normalized_name).transpose()?.flatten();
             let path = if path == "~" {
                 home
             } else if let Some(p) = path.strip_prefix("~/") {
@@ -286,6 +407,7 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
                 let mut child = cmd.spawn().context("launch nohup codex app-server")?;
                 let c = Connection {
                     id: id.clone(),
+                    name,
                     path: path.to_string_lossy().into(),
                     pid: child.id(),
                     start: identity(child.id()).unwrap_or_default(),
@@ -346,6 +468,116 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn folders_are_created_without_overwriting_or_escaping_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().to_str().unwrap();
+        let directory = mkdir(parent, "café's project").unwrap();
+        assert_eq!(
+            directory.path,
+            root.path().join("café's project").to_str().unwrap()
+        );
+        fs::write(root.path().join("café's project/keep"), "unchanged").unwrap();
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "/absolute",
+            "line\nbreak",
+            "café's project",
+        ] {
+            assert!(mkdir(parent, bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            fs::read_to_string(root.path().join("café's project/keep")).unwrap(),
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn log_tail_is_bounded_ordered_and_removes_terminal_controls() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("logs")).unwrap();
+        let id = "b".repeat(32);
+        let file = root.path().join("logs").join(format!("{id}.log"));
+        fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        assert_eq!(logs_at(root.path(), &id, 2).unwrap(), "two\nthree");
+        assert_eq!(logs_at(root.path(), &id, 1).unwrap(), "three");
+        fs::write(
+            &file,
+            format!("{}\nlast\n\x1b]52;secret\x07\n", "x".repeat(200_000)),
+        )
+        .unwrap();
+        let tail = logs_at(root.path(), &id, 2000).unwrap();
+        assert_eq!(tail, "last\n]52;secret");
+        fs::write(&file, "x".repeat(200_000)).unwrap();
+        assert_eq!(logs_at(root.path(), &id, 1).unwrap().len(), 128 * 1024);
+        assert!(logs_at(root.path(), "../escape", 1).is_err());
+        assert!(logs_at(root.path(), &id, 0).is_err());
+        assert!(logs_at(root.path(), &id, 2001).is_err());
+    }
+
+    #[test]
+    fn rename_preserves_credentials_and_old_records_remain_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_owned();
+        handle_at(Request::List, root.clone(), root.clone()).unwrap();
+        let id = "c".repeat(32);
+        let file = root.join("conns").join(format!("{id}.json"));
+        let original = serde_json::json!({"id":id,"path":"/project", "pid":std::process::id(),
+            "start":identity(std::process::id()).unwrap(), "port":1234,"direct":true,
+            "token":"keep-token", "certificate":"keep-cert", "log":"log", "created":17});
+        fs::write(&file, original.to_string()).unwrap();
+        for (name, expected) in [("  café  ", Some("café")), ("", None)] {
+            let rows = handle_at(
+                Request::Rename {
+                    id: id.clone(),
+                    name: name.into(),
+                },
+                root.clone(),
+                root.clone(),
+            )
+            .unwrap();
+            assert_eq!(rows[0].name.as_deref(), expected);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+            assert_eq!(saved["token"], "keep-token");
+            assert_eq!(saved["certificate"], "keep-cert");
+            assert_eq!(saved["created"], 17);
+            assert_eq!(
+                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        for bad in ["x".repeat(81), "bad\nname".into(), "\nname".into()] {
+            assert!(
+                handle_at(
+                    Request::Rename {
+                        id: id.clone(),
+                        name: bad
+                    },
+                    root.clone(),
+                    root.clone()
+                )
+                .is_err()
+            );
+        }
+        fs::remove_file(&file).unwrap();
+        assert!(
+            handle_at(
+                Request::Rename {
+                    id,
+                    name: "gone".into()
+                },
+                root.clone(),
+                root
+            )
+            .is_err()
+        );
+        assert!(!file.exists());
+    }
     #[test]
     fn identity_tracks_a_child_until_exit() {
         let mut child = Command::new("sh")
@@ -388,6 +620,7 @@ mod tests {
         handle_at(Request::List, root.clone(), home.clone()).unwrap();
         let c = Connection {
             id: "a".repeat(32),
+            name: None,
             path: "/test".into(),
             pid: std::process::id(),
             start: "wrong-start-time".into(),
@@ -430,6 +663,7 @@ mod tests {
                     path: dir.path().join("missing").to_string_lossy().into(),
                     direct: false,
                     server_name: None,
+                    name: None,
                 },
                 dir.path().into(),
                 dir.path().into()

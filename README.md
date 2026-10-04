@@ -20,20 +20,72 @@ rcodex devbox '~/projects/my-app'
 | Key | Action |
 | --- | --- |
 | ↑ / ↓, j / k | Select a workspace |
-| Enter | Connect, or launch from the new-project entry |
+| Enter | New conversation on selected server, or launch from the new-project entry |
+| c | Continue the latest conversation in that server's project |
+| s | Open Codex's remote conversation picker |
+| / | Search servers by name, path, or ID; Enter applies, Esc clears |
+| e | Rename selected server; empty name restores the folder label |
+| l | Open server logs, with follow/pause and scrolling |
 | n | Browse remote folders for a new project |
+| b | Browse starting in the selected server's project directory |
 | Shift+X / Shift+Q | Stop selected server, with confirmation |
-| r | Refresh active servers |
+| r | Refresh active servers (also automatic every 5 seconds) |
 | q / Esc | Exit or cancel |
 | Ctrl+C | Exit |
 
 The folder browser starts in the remote user's home directory. Use **↑/↓** to select,
 **Enter/→** to open a folder, **←** for its parent, and **Home** to return home.
 Type to filter folder names; Backspace edits the filter. **Space launches in the
-current directory** and Esc returns to the server list. Directory symlinks are
+current directory** and **Ctrl+N creates a folder and opens it**. Existing files
+and directories are never overwritten. Esc returns to the server list. Directory symlinks are
 followed; hidden folders appear after ordinary folders.
 
-The directory must already exist. Each launch starts a separate server; reconnecting through the picker reuses that server. Closing Codex leaves the server running. Stopping a server disconnects **all** its clients.
+Rows show the server name, short ID, transport, and uptime. Refresh preserves the
+selected server by ID. Stop confirmation captures that ID, not its row number.
+
+The log viewer refreshes every 2 seconds. **f** toggles following; **↑/↓** and
+**PageUp/PageDown** scroll; **←/→** pan long lines; **Home** goes to the top;
+**End** follows the tail; **r** refreshes; **Esc** returns. It shows the latest 500
+lines, capped at 128 KiB. These are app-server diagnostic logs, not conversation
+history. Logs may contain private project information.
+
+Each launch starts a separate server; reconnecting through the picker reuses
+that server. Closing Codex leaves the server running. Stopping a server
+disconnects **all** its clients.
+
+## Manage workspaces from the command line
+
+Every command requires your **existing local Codex installation**. rcodex never
+bundles or installs Codex.
+
+```sh
+rcodex devbox /srv/app --name overnight --detach
+rcodex devbox --list
+rcodex devbox --list --json
+rcodex devbox --attach overnight --last
+rcodex devbox --rename overnight --name backend
+rcodex devbox --logs backend --lines 100
+rcodex devbox --stop backend           # asks for confirmation
+rcodex devbox --stop backend --yes     # explicit confirmation for scripts
+```
+
+`--detach` starts the remote server and exits; it does **not** submit an agent task.
+Add `--json` to get an array containing the new server's metadata. `--list --json`
+uses the same format. Neither output includes bearer tokens, TLS certificates,
+or process identity secrets. Device-login instructions go to stderr so they do
+not contaminate JSON output.
+
+Selectors accept a server name, an exact remote path, or a unique ID prefix of at
+least four characters. Ambiguous names, paths, and prefixes fail rather than
+selecting arbitrarily; use the full ID to disambiguate. Names are optional and
+limited to 80 characters. Listing, renaming, logs, and stopping need SSH access
+but do not require a remote Codex login, so expired authentication cannot prevent
+cleanup. Noninteractive stop requires `--yes`.
+
+Logs are retained after a server stops. To read a stopped or crashed server's
+log, pass its **full 32-character ID** to `--logs`. CLI log reads default to 200
+lines, accept 1–2000 lines, and are capped at 128 KiB per request. Terminal control
+characters are removed before display.
 
 ## Resume a conversation
 

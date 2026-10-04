@@ -5,6 +5,7 @@ use std::{
     env, fs,
     io::{IsTerminal, Write},
     net::TcpListener,
+    os::fd::AsFd,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
@@ -128,6 +129,7 @@ impl Client {
         }
         let status = login
             .args([&self.host, "codex login --device-auth"])
+            .stdout(std::io::stderr().as_fd().try_clone_to_owned()?)
             .status()
             .context("run remote Codex login")?;
         ensure!(
@@ -179,10 +181,23 @@ impl Client {
         Ok(())
     }
     pub fn browse(&self, path: &str) -> Result<Directory> {
-        let command = format!("{} __browse {}", self.helper, quote(path));
+        self.query("__browse", &[path])
+    }
+    pub fn mkdir(&self, parent: &str, name: &str) -> Result<Directory> {
+        self.query("__mkdir", &[parent, name])
+    }
+    pub fn logs(&self, id: &str, lines: usize) -> Result<String> {
+        self.query("__logs", &[id, &lines.to_string()])
+    }
+    fn query<T: serde::de::DeserializeOwned>(&self, operation: &str, args: &[&str]) -> Result<T> {
+        let command = format!(
+            "{} {operation} {}",
+            self.helper,
+            args.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" ")
+        );
         let out = checked(self.ssh().args([&self.host, &command]))?;
-        let reply: Result<Directory, String> =
-            serde_json::from_slice(&out).context("decode remote directory")?;
+        let reply: Result<T, String> =
+            serde_json::from_slice(&out).context("decode remote response")?;
         reply.map_err(anyhow::Error::msg)
     }
     fn hostname(&self) -> Result<String> {
