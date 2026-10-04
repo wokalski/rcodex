@@ -23,6 +23,12 @@ struct Args {
     /// Connect with authenticated, unencrypted WebSockets; trusted networks only
     #[arg(long)]
     direct: bool,
+    /// Resume a remote conversation (omit the ID to open Codex's session picker)
+    #[arg(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "last")]
+    resume: Option<String>,
+    /// Resume the most recently updated remote conversation in the selected project
+    #[arg(long)]
+    last: bool,
 }
 
 fn main() {
@@ -126,12 +132,85 @@ fn run() -> Result<()> {
         return Ok(());
     };
     let endpoint = client.endpoint(&selected, args.direct)?;
+    Err(codex_command(&endpoint, &selected, args.resume.as_deref(), args.last).exec())
+        .context("launch local Codex")
+}
+
+fn codex_command(
+    endpoint: &str,
+    selected: &remote::Connection,
+    resume: Option<&str>,
+    last: bool,
+) -> Command {
     let mut codex = Command::new("codex");
-    codex.args(["--remote", &endpoint, "--cd", &selected.path]);
+    if resume.is_some() || last {
+        codex.arg("resume");
+        if let Some(id) = resume.filter(|id| !id.is_empty()) {
+            codex.arg(id);
+        }
+        if last {
+            codex.arg("--last");
+        }
+    }
+    codex.args(["--remote", endpoint, "--cd", &selected.path]);
     if let Some(token) = &selected.token {
         codex
             .env("RCODEX_AUTH_TOKEN", token)
             .args(["--remote-auth-token-env", "RCODEX_AUTH_TOKEN"]);
     }
-    Err(codex.exec()).context("launch local Codex")
+    codex
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resume_modes_preserve_remote_endpoint_directory_and_authentication() {
+        let connection = remote::Connection {
+            id: "connection".into(),
+            path: "/remote/project with spaces".into(),
+            pid: 1,
+            start: "start".into(),
+            port: 1234,
+            direct: true,
+            token: Some("test-token".into()),
+            log: "log".into(),
+            created: 0,
+        };
+        for (flags, prefix) in [
+            (vec![], vec![]),
+            (vec!["--resume"], vec!["resume"]),
+            (vec!["--resume", "session-id"], vec!["resume", "session-id"]),
+            (vec!["--last"], vec!["resume", "--last"]),
+        ] {
+            let args =
+                Args::try_parse_from(["rcodex", "devbox", "--direct"].into_iter().chain(flags))
+                    .unwrap();
+            let command = codex_command(
+                "ws://remote:1234",
+                &connection,
+                args.resume.as_deref(),
+                args.last,
+            );
+            let mut expected = prefix;
+            expected.extend([
+                "--remote",
+                "ws://remote:1234",
+                "--cd",
+                "/remote/project with spaces",
+                "--remote-auth-token-env",
+                "RCODEX_AUTH_TOKEN",
+            ]);
+            assert_eq!(command.get_args().collect::<Vec<_>>(), expected);
+            assert_eq!(
+                command.get_envs().collect::<Vec<_>>(),
+                vec![(
+                    std::ffi::OsStr::new("RCODEX_AUTH_TOKEN"),
+                    Some(std::ffi::OsStr::new("test-token"))
+                )]
+            );
+        }
+        assert!(Args::try_parse_from(["rcodex", "devbox", "--resume", "--last"]).is_err());
+    }
 }

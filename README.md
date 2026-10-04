@@ -35,6 +35,23 @@ followed; hidden folders appear after ordinary folders.
 
 The directory must already exist. Each launch starts a separate server; reconnecting through the picker reuses that server. Closing Codex leaves the server running. Stopping a server disconnects **all** its clients.
 
+## Resume a conversation
+
+```sh
+rcodex devbox --resume             # select a server, then a remote conversation
+rcodex devbox --resume SESSION_ID  # select a server, then resume this conversation
+rcodex devbox --last               # select a server, then resume its project's latest conversation
+rcodex devbox --direct --resume    # also works with direct WebSockets
+```
+
+Choose the existing server from the workspace list to rejoin a live conversation.
+Resume uses Codex's remote session picker and remote history, not your laptop's
+session files. A conversation active in another app-server may be read-only:
+connect to its owning server to continue it. Supplying a project path or choosing
+"Launch a new project" starts a new server; use that for saved conversations whose
+old server is no longer running. Codex's `--last` starts a fresh conversation if
+there is no matching history in the selected project.
+
 ## Requirements and transport
 
 - Clients: **macOS (Apple Silicon or Intel)** and **x86-64 Linux**. Remote servers: **x86-64 Linux**. The macOS binary embeds a static Linux helper; no remote build tools or Rosetta are needed. Other remote architectures are not yet supported by the macOS client.
