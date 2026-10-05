@@ -19,6 +19,7 @@ in
         ++ pkgs.lib.optional pkgs.stdenv.isDarwin ./bin);
     };
     cargoLock.lockFile = ./Cargo.lock;
+    nativeCheckInputs = [pkgs.git];
     meta = {
       description = manifest.package.description;
       mainProgram = "rcodex";

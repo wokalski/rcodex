@@ -6,6 +6,7 @@ use std::{
     io::{IsTerminal, Write},
     net::TcpListener,
     os::fd::AsFd,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Arc,
@@ -17,6 +18,7 @@ pub struct Client {
     pub host: String,
     state: Arc<State>,
     helper: String,
+    batch: bool,
 }
 struct State {
     host: String,
@@ -42,6 +44,9 @@ pub fn cleanup(host: &str, control: &str, directory: &str) {
 }
 pub fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+fn shell_script(path: &str) -> String {
+    format!("cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -i", quote(path))
 }
 fn checked(cmd: &mut Command) -> Result<Vec<u8>> {
     let out = cmd.output().context("run SSH")?;
@@ -72,9 +77,29 @@ impl Client {
     fn ssh(&self) -> Command {
         let mut cmd = Command::new("ssh");
         cmd.arg("-S").arg(self.control());
+        if self.batch {
+            cmd.args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "ConnectTimeout=5",
+            ]);
+        }
         cmd
     }
     pub fn connect(host: String) -> Result<Self> {
+        Self::connect_mode(host, false)
+    }
+    pub fn connect_background(host: String) -> Result<Self> {
+        Self::connect_mode(host, true)
+    }
+    fn connect_mode(host: String, batch: bool) -> Result<Self> {
+        ensure!(
+            !host.is_empty() && !host.starts_with('-') && !host.chars().any(char::is_control),
+            "invalid SSH address"
+        );
         let dir = tempfile::Builder::new().prefix("rcodex-").tempdir()?;
         let exe = helper_binary()?;
         let hash = format!("{:x}", Sha256::digest(&exe));
@@ -82,7 +107,31 @@ impl Client {
             host: host.clone(),
             state: Arc::new(State { host, dir }),
             helper: format!("\"$HOME/.cache/rcodex/{}\"", &hash[..24]),
+            batch,
         };
+        // The watcher survives exec and cancellation of a background probe.
+        let pid = std::process::id();
+        let start = crate::remote::identity(pid).context("identify local process")?;
+        let mut watcher = Command::new(env::current_exe()?);
+        watcher
+            .args([
+                "__watch",
+                &pid.to_string(),
+                &start,
+                &client.host,
+                &client.control().to_string_lossy(),
+                &client.directory().to_string_lossy(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            watcher.pre_exec(|| {
+                nix::unistd::setsid().map_err(std::io::Error::from)?;
+                Ok(())
+            });
+        }
+        watcher.spawn().context("start SSH cleanup watcher")?;
         let status = client
             .ssh()
             .args([
@@ -183,11 +232,31 @@ impl Client {
     pub fn browse(&self, path: &str) -> Result<Directory> {
         self.query("__browse", &[path])
     }
+    pub fn snapshot(&self) -> Result<crate::sessions::Snapshot> {
+        self.query("__snapshot", &[])
+    }
+    pub fn start_thread(&self, server: &str, path: &str) -> Result<crate::sessions::Conversation> {
+        self.query("__thread_start", &[server, path])
+    }
+    pub fn read_thread(&self, server: &str, id: &str) -> Result<crate::sessions::Conversation> {
+        self.query("__thread_read", &[server, id])
+    }
     pub fn mkdir(&self, parent: &str, name: &str) -> Result<Directory> {
         self.query("__mkdir", &[parent, name])
     }
     pub fn logs(&self, id: &str, lines: usize) -> Result<String> {
         self.query("__logs", &[id, &lines.to_string()])
+    }
+    pub fn inspect(&self, connection: &Connection) -> String {
+        let git = self
+            .query::<String>("__git", &[&connection.path])
+            .unwrap_or_else(|error| format!("{error:#}"));
+        connection.details(&git)
+    }
+    pub fn shell(&self, path: &str) -> Command {
+        let mut command = self.ssh();
+        command.args(["-t", &self.host, &shell_script(path)]);
+        command
     }
     fn query<T: serde::de::DeserializeOwned>(&self, operation: &str, args: &[&str]) -> Result<T> {
         let command = format!(
@@ -211,10 +280,9 @@ impl Client {
             .to_owned())
     }
     pub fn call(&self, mut request: Request) -> Result<Vec<Connection>> {
-        if let Request::Start {
+        if let Request::Ensure {
             direct: true,
             server_name,
-            ..
         } = &mut request
         {
             *server_name = Some(self.hostname()?);
@@ -232,14 +300,33 @@ impl Client {
         Ok(reply.rows)
     }
     pub fn endpoint(&self, conn: &Connection, direct: bool) -> Result<String> {
-        if direct {
+        if let Some(socket) = &conn.socket {
+            ensure!(!direct, "the Codex app daemon requires SSH; omit --direct");
             ensure!(
-                conn.direct,
-                "server is loopback-only; reconnect without --direct"
+                Path::new(socket).is_absolute()
+                    && !socket.contains(':')
+                    && !socket.chars().any(char::is_control),
+                "Codex daemon socket path cannot be forwarded by OpenSSH"
             );
-            let certificate = conn.certificate.as_deref().context(
-                "this server uses legacy plaintext direct mode; reconnect without --direct, or launch a new TLS server"
-            )?;
+            let local = self.directory().join("codex.sock");
+            checked(self.ssh().args([
+                "-O",
+                "forward",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "StreamLocalBindMask=0177",
+                "-L",
+                &format!("{}:{socket}", local.display()),
+                &self.host,
+            ]))?;
+            return Ok(format!("unix://{}", local.display()));
+        }
+        if direct {
+            let certificate = conn
+                .certificate
+                .as_deref()
+                .context("server is loopback-only; reconnect without --direct")?;
             let host = self.hostname()?;
             crate::tls::check(&host, conn.port, certificate).with_context(|| format!(
                 "cannot reach direct TLS server at {host}:{}; check firewall/routing or reconnect without --direct. The remote server is still running",
@@ -276,6 +363,35 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shell_enters_literal_directory_and_does_not_fall_back_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project ' $(touch PWNED)");
+        fs::create_dir(&project).unwrap();
+        let shell = root.path().join("shell");
+        fs::write(&shell, "#!/bin/sh\nprintf '%s\\n%s' \"$PWD\" \"$1\"\n").unwrap();
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+        let run = |path: &Path| {
+            Command::new("sh")
+                .current_dir(root.path())
+                .env("SHELL", &shell)
+                .args(["-c", &shell_script(path.to_str().unwrap())])
+                .output()
+                .unwrap()
+        };
+        let output = run(&project);
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{}\n-i", project.display())
+        );
+        assert!(!root.path().join("PWNED").exists());
+        let output = run(&root.path().join("missing"));
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+    }
+
     #[test]
     fn shell_quote_preserves_literal_paths() {
         let path = "a'b $(touch nope);\n日本語";

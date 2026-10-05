@@ -23,19 +23,13 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Connection {
     pub id: String,
-    #[serde(default)]
     pub name: Option<String>,
-    #[serde(default)]
-    pub favorite: bool,
-    #[serde(default)]
-    pub last_used: u64,
     pub path: String,
     pub pid: u32,
     pub start: String,
     pub port: u16,
-    pub direct: bool,
+    pub socket: Option<String>,
     pub token: Option<String>,
-    #[serde(default)]
     pub certificate: Option<String>,
     pub log: String,
     pub created: u64,
@@ -44,13 +38,9 @@ pub struct Connection {
 #[serde(tag = "action", rename_all = "lowercase")]
 pub enum Request {
     List,
-    Start {
-        path: String,
+    Ensure {
         direct: bool,
-        #[serde(default)]
         server_name: Option<String>,
-        #[serde(default)]
-        name: Option<String>,
     },
     Stop {
         id: String,
@@ -59,13 +49,6 @@ pub enum Request {
         id: String,
         name: String,
     },
-    Favorite {
-        id: String,
-        favorite: bool,
-    },
-    Visit {
-        id: String,
-    },
 }
 #[derive(Serialize, Deserialize)]
 pub struct Reply {
@@ -73,11 +56,83 @@ pub struct Reply {
     pub error: Option<String>,
 }
 
+pub fn select(rows: Vec<Connection>, selector: &str) -> Result<Connection> {
+    if let Some(row) = rows.iter().find(|r| r.id == selector) {
+        return Ok(row.clone());
+    }
+    let mut matches = rows.into_iter().filter(|r| {
+        r.name.as_deref() == Some(selector)
+            || r.path == selector
+            || (selector.len() >= 4 && r.id.starts_with(selector))
+    });
+    let row = matches
+        .next()
+        .with_context(|| format!("no running server matches {selector:?}; use --list"))?;
+    ensure!(
+        matches.next().is_none(),
+        "ambiguous server {selector:?}; use a longer ID from --list"
+    );
+    Ok(row)
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Directory {
     pub path: String,
     pub parent: Option<String>,
     pub folders: Vec<String>,
+}
+
+pub fn git_status(path: &str) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut child = tokio::process::Command::new("git")
+                .args([
+                    "--no-optional-locks",
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "color.status=false",
+                    "-C",
+                    path,
+                    "status",
+                    "--short",
+                    "--branch",
+                    "--untracked-files=normal",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .context("run Git (requires Git on the remote host)")?;
+            let mut bytes = Vec::new();
+            child
+                .stdout
+                .take()
+                .context("open Git output")?
+                .take(64 * 1024)
+                .read_to_end(&mut bytes)
+                .await?;
+            if bytes.len() == 64 * 1024 {
+                let _ = child.kill().await;
+                return Ok(format!(
+                    "{}\n[Git output truncated at 64 KiB]",
+                    clean_text(&String::from_utf8_lossy(&bytes))
+                ));
+            }
+            ensure!(
+                child.wait().await?.success(),
+                "Git status unavailable: not a repository, inaccessible directory, or Git error"
+            );
+            Ok(clean_text(&String::from_utf8_lossy(&bytes)))
+        })
+        .await
+        .context("Git status timed out after 5 seconds")?
+    })
 }
 
 pub fn browse(path: &str) -> Result<Directory> {
@@ -230,6 +285,32 @@ pub fn identity(pid: u32) -> Option<String> {
     ))
 }
 impl Connection {
+    pub fn details(&self, git: &str) -> String {
+        if let Some(socket) = &self.socket {
+            return format!(
+                "Codex app daemon\n\nDirectory  {}\nSocket     {}\nTransport  SSH Unix socket\nLifecycle  Managed by Codex, shared with the app\n\nGIT STATUS\n{}",
+                self.path.escape_debug(),
+                socket.escape_debug(),
+                git
+            );
+        }
+        format!(
+            "{}\n\nProject    {}\nServer     {}\nProcess    {}\nPort       {}\nTransport  {}\nLog        {}\n\nGIT STATUS\n{}",
+            self.label().escape_debug(),
+            self.path.escape_debug(),
+            self.id,
+            self.pid,
+            self.port,
+            if self.certificate.is_some() {
+                "TLS"
+            } else {
+                "SSH tunnel"
+            },
+            self.log.escape_debug(),
+            git
+        )
+    }
+
     pub fn label(&self) -> &str {
         self.name.as_deref().unwrap_or_else(|| {
             std::path::Path::new(&self.path)
@@ -260,230 +341,260 @@ fn terminate(c: &Connection, signal: Signal) -> Result<()> {
 }
 pub fn handle(request: Request) -> Result<Vec<Connection>> {
     let home = PathBuf::from(env::var("HOME").context("HOME is unset")?);
+    if let Some(rows) = crate::daemon::handle(&request, &home)? {
+        return Ok(rows);
+    }
     let root = state_dir(&home)?;
     handle_at(request, root, home)
 }
 fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Connection>> {
-    let conns = root.join("conns");
-    let logs = root.join("logs");
-    for dir in [&root, &conns, &logs] {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-    }
-    // A stable lock serializes atomic record replacement with stop/removal.
-    let registry_lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(root.join("registry.lock"))?;
-    registry_lock.lock()?;
+    let registry = Registry::open(root, home)?;
     match request {
-        Request::List => {
-            let mut rows = vec![];
-            for entry in fs::read_dir(conns)? {
-                let file = entry?.path();
-                if file.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
-                let c: Connection = serde_json::from_slice(&fs::read(&file)?)
-                    .with_context(|| format!("read {}", file.display()))?;
-                if c.active() {
-                    rows.push(c);
-                }
-            }
-            rows.sort_by(|a, b| {
-                b.favorite
-                    .cmp(&a.favorite)
-                    .then(a.path.cmp(&b.path))
-                    .then(a.created.cmp(&b.created))
-                    .then(a.id.cmp(&b.id))
-            });
-            Ok(rows)
-        }
-        Request::Rename { ref id, .. }
-        | Request::Favorite { ref id, .. }
-        | Request::Visit { ref id } => {
-            validate_id(id)?;
-            let file = conns.join(format!("{id}.json"));
-            let mut c: Connection = serde_json::from_slice(&fs::read(&file)?)?;
-            ensure!(c.active(), "server is no longer running");
-            match request {
-                Request::Rename { name, .. } => c.name = normalized_name(&name)?,
-                Request::Favorite { favorite, .. } => c.favorite = favorite,
-                Request::Visit { .. } => {
-                    c.last_used = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64
-                }
-                _ => unreachable!(),
-            }
-            let mut temp = tempfile::NamedTempFile::new_in(&conns)?;
-            temp.write_all(&serde_json::to_vec(&c)?)?;
-            temp.persist(&file)?;
-            Ok(vec![c])
-        }
+        Request::List => registry.list(),
+        Request::Ensure {
+            direct,
+            server_name,
+        } => Ok(vec![registry.ensure(direct, server_name)?]),
+        Request::Rename { id, name } => registry.update(&id, |c| {
+            c.name = normalized_name(&name)?;
+            Ok(())
+        }),
         Request::Stop { id } => {
-            validate_id(&id)?;
-            let file = conns.join(format!("{id}.json"));
-            let c: Connection = serde_json::from_slice(&fs::read(&file)?)?;
+            registry.stop(&id)?;
+            Ok(vec![])
+        }
+    }
+}
+
+/// The lock lives as long as the registry. Startup, record replacement,
+/// and termination cannot accidentally escape the same critical section.
+struct Registry {
+    record: PathBuf,
+    conns: PathBuf,
+    logs: PathBuf,
+    home: PathBuf,
+    _lock: fs::File,
+}
+
+impl Registry {
+    fn open(root: PathBuf, home: PathBuf) -> Result<Self> {
+        let conns = root.join("conns");
+        let logs = root.join("logs");
+        for dir in [&root, &conns, &logs] {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)?;
+        }
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(root.join("registry.lock"))?;
+        lock.lock()?;
+        Ok(Self {
+            record: root.join("server.json"),
+            conns,
+            logs,
+            home,
+            _lock: lock,
+        })
+    }
+
+    fn read(&self, id: &str) -> Result<Connection> {
+        validate_id(id)?;
+        let server = self.load()?.context("no host server")?;
+        ensure!(server.id == id, "host server has changed; use --list");
+        Ok(server)
+    }
+
+    fn load(&self) -> Result<Option<Connection>> {
+        match fs::read(&self.record) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn save(&self, connection: &Connection) -> Result<()> {
+        let mut temp = tempfile::NamedTempFile::new_in(&self.conns)?;
+        temp.write_all(&serde_json::to_vec(connection)?)?;
+        temp.persist(&self.record)?;
+        Ok(())
+    }
+
+    fn list(&self) -> Result<Vec<Connection>> {
+        Ok(self
+            .load()?
+            .filter(Connection::active)
+            .into_iter()
+            .collect())
+    }
+
+    fn update(
+        &self,
+        id: &str,
+        edit: impl FnOnce(&mut Connection) -> Result<()>,
+    ) -> Result<Vec<Connection>> {
+        let mut connection = self.read(id)?;
+        ensure!(connection.active(), "server is no longer running");
+        edit(&mut connection)?;
+        self.save(&connection)?;
+        Ok(vec![connection])
+    }
+
+    fn ensure(&self, direct: bool, server_name: Option<String>) -> Result<Connection> {
+        if let Some(c) = self.load()?.filter(Connection::active) {
+            ensure!(
+                !direct || c.certificate.is_some(),
+                "the host server is SSH-only; reconnect without --direct. Stop it explicitly before changing transport; stopping interrupts all its conversations"
+            );
+            return Ok(c);
+        }
+        self.start(direct, server_name)
+    }
+
+    fn stop(&self, id: &str) -> Result<()> {
+        let c = self.read(id)?;
+        if c.active() {
+            terminate(&c, Signal::SIGTERM)?;
+            for _ in 0..50 {
+                if !c.active() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
             if c.active() {
-                terminate(&c, Signal::SIGTERM)?;
-                for _ in 0..50 {
-                    if !c.active() {
+                terminate(&c, Signal::SIGKILL)?;
+            }
+        }
+        fs::remove_file(&self.record)?;
+        for extension in ["token", "pem", "key"] {
+            let _ = fs::remove_file(self.conns.join(format!("{id}.{extension}")));
+        }
+        Ok(())
+    }
+
+    fn start(&self, direct: bool, server_name: Option<String>) -> Result<Connection> {
+        let conns = &self.conns;
+        let logs = &self.logs;
+        let path = &self.home;
+        let host = if direct { "0.0.0.0" } else { "127.0.0.1" };
+        let listener = TcpListener::bind((host, 0))?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let id = Uuid::new_v4().simple().to_string();
+        let log = logs.join(format!("{id}.log"));
+        let token_file = conns.join(format!("{id}.token"));
+        let cert_file = conns.join(format!("{id}.pem"));
+        let key_file = conns.join(format!("{id}.key"));
+        let token =
+            direct.then(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
+        if let Some(token) = &token {
+            private_write(&token_file, token.as_bytes())?;
+        }
+        let result = (|| -> Result<Connection> {
+            let certificate = if direct {
+                let name = server_name.context("direct mode needs an SSH-resolved server name")?;
+                let certified = rcgen::generate_simple_self_signed(vec![
+                    name,
+                    "localhost".into(),
+                    "127.0.0.1".into(),
+                ])?;
+                let certificate = certified.cert.pem();
+                private_write(&cert_file, certificate.as_bytes())?;
+                private_write(&key_file, certified.signing_key.serialize_pem().as_bytes())?;
+                Some(certificate)
+            } else {
+                None
+            };
+            let output = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&log)?;
+            let mut cmd = Command::new("nohup");
+            if direct {
+                cmd.arg(env::current_exe()?)
+                    .arg("__tls")
+                    .arg(port.to_string())
+                    .arg(&token_file)
+                    .arg(&cert_file)
+                    .arg(&key_file);
+            } else {
+                cmd.args([
+                    "codex",
+                    "app-server",
+                    "--listen",
+                    &format!("ws://{host}:{port}"),
+                ]);
+            }
+            cmd.current_dir(path)
+                .stdin(Stdio::null())
+                .stderr(output.try_clone()?)
+                .stdout(output);
+            unsafe {
+                cmd.pre_exec(|| {
+                    nix::unistd::setsid().map_err(std::io::Error::from)?;
+                    Ok(())
+                });
+            }
+            let mut child = cmd.spawn().context("launch nohup codex app-server")?;
+            let c = Connection {
+                id: id.clone(),
+                name: Some("Host server".into()),
+                path: path.to_string_lossy().into(),
+                pid: child.id(),
+                start: identity(child.id()).unwrap_or_default(),
+                port,
+                socket: None,
+                token,
+                certificate,
+                log: log.to_string_lossy().into(),
+                created: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            };
+            let started = (|| -> Result<()> {
+                let mut ready = false;
+                for _ in 0..150 {
+                    if child.try_wait()?.is_some() {
+                        break;
+                    }
+                    if TcpStream::connect_timeout(
+                        &format!("127.0.0.1:{port}").parse()?,
+                        Duration::from_millis(100),
+                    )
+                    .is_ok()
+                    {
+                        thread::sleep(Duration::from_millis(150));
+                        ready = child.try_wait()?.is_none() && c.active();
                         break;
                     }
                     thread::sleep(Duration::from_millis(100));
                 }
-                if c.active() {
-                    terminate(&c, Signal::SIGKILL)?;
+                if !ready {
+                    bail!(
+                        "app-server failed to start; log {}:\n{}",
+                        log.display(),
+                        fs::read_to_string(&log).unwrap_or_default()
+                    );
                 }
-            }
-            fs::remove_file(file)?;
-            let _ = fs::remove_file(conns.join(format!("{id}.token")));
-            let _ = fs::remove_file(conns.join(format!("{id}.pem")));
-            let _ = fs::remove_file(conns.join(format!("{id}.key")));
-            Ok(vec![])
-        }
-        Request::Start {
-            path,
-            direct,
-            server_name,
-            name,
-        } => {
-            let name = name.as_deref().map(normalized_name).transpose()?.flatten();
-            let path = if path == "~" {
-                home
-            } else if let Some(p) = path.strip_prefix("~/") {
-                home.join(p)
-            } else {
-                PathBuf::from(path)
-            };
-            let path = path
-                .canonicalize()
-                .context("project directory does not exist")?;
-            ensure!(path.is_dir(), "project path is not a directory");
-            let host = if direct { "0.0.0.0" } else { "127.0.0.1" };
-            let listener = TcpListener::bind((host, 0))?;
-            let port = listener.local_addr()?.port();
-            drop(listener);
-            let id = Uuid::new_v4().simple().to_string();
-            let log = logs.join(format!("{id}.log"));
-            let token_file = conns.join(format!("{id}.token"));
-            let cert_file = conns.join(format!("{id}.pem"));
-            let key_file = conns.join(format!("{id}.key"));
-            let token =
-                direct.then(|| format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple()));
-            if let Some(token) = &token {
-                private_write(&token_file, token.as_bytes())?;
-            }
-            let result = (|| -> Result<Vec<Connection>> {
-                let certificate = if direct {
-                    let name =
-                        server_name.context("direct mode needs an SSH-resolved server name")?;
-                    let certified = rcgen::generate_simple_self_signed(vec![
-                        name,
-                        "localhost".into(),
-                        "127.0.0.1".into(),
-                    ])?;
-                    let certificate = certified.cert.pem();
-                    private_write(&cert_file, certificate.as_bytes())?;
-                    private_write(&key_file, certified.signing_key.serialize_pem().as_bytes())?;
-                    Some(certificate)
-                } else {
-                    None
-                };
-                let output = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&log)?;
-                let mut cmd = Command::new("nohup");
-                if direct {
-                    cmd.arg(env::current_exe()?)
-                        .arg("__tls")
-                        .arg(port.to_string())
-                        .arg(&token_file)
-                        .arg(&cert_file)
-                        .arg(&key_file);
-                } else {
-                    cmd.args([
-                        "codex",
-                        "app-server",
-                        "--listen",
-                        &format!("ws://{host}:{port}"),
-                    ]);
-                }
-                cmd.current_dir(&path)
-                    .stdin(Stdio::null())
-                    .stderr(output.try_clone()?)
-                    .stdout(output);
-                unsafe {
-                    cmd.pre_exec(|| {
-                        nix::unistd::setsid().map_err(std::io::Error::from)?;
-                        Ok(())
-                    });
-                }
-                let mut child = cmd.spawn().context("launch nohup codex app-server")?;
-                let c = Connection {
-                    id: id.clone(),
-                    name,
-                    favorite: false,
-                    last_used: 0,
-                    path: path.to_string_lossy().into(),
-                    pid: child.id(),
-                    start: identity(child.id()).unwrap_or_default(),
-                    port,
-                    direct,
-                    token,
-                    certificate,
-                    log: log.to_string_lossy().into(),
-                    created: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-                };
-                let started = (|| -> Result<()> {
-                    let mut ready = false;
-                    for _ in 0..150 {
-                        if child.try_wait()?.is_some() {
-                            break;
-                        }
-                        if TcpStream::connect_timeout(
-                            &format!("127.0.0.1:{port}").parse()?,
-                            Duration::from_millis(100),
-                        )
-                        .is_ok()
-                        {
-                            thread::sleep(Duration::from_millis(150));
-                            ready = child.try_wait()?.is_none() && c.active();
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                    }
-                    if !ready {
-                        bail!(
-                            "app-server failed to start; log {}:\n{}",
-                            log.display(),
-                            fs::read_to_string(&log).unwrap_or_default()
-                        );
-                    }
-                    let tmp = conns.join(format!("{id}.tmp"));
-                    private_write(&tmp, &serde_json::to_vec(&c)?)?;
-                    fs::rename(tmp, conns.join(format!("{id}.json")))?;
-                    Ok(())
-                })();
-                if let Err(error) = started {
-                    let _ = terminate(&c, Signal::SIGKILL);
-                    let _ = child.wait();
-                    return Err(error);
-                }
-                Ok(vec![c])
+                self.save(&c)?;
+                Ok(())
             })();
-            if result.is_err() {
-                let _ = fs::remove_file(token_file);
-                let _ = fs::remove_file(cert_file);
-                let _ = fs::remove_file(key_file);
+            if let Err(error) = started {
+                let _ = terminate(&c, Signal::SIGKILL);
+                let _ = child.wait();
+                return Err(error);
             }
-            result
+            Ok(c)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(token_file);
+            let _ = fs::remove_file(cert_file);
+            let _ = fs::remove_file(key_file);
         }
+        result
     }
 }
 
@@ -542,68 +653,16 @@ mod tests {
     }
 
     #[test]
-    fn rename_preserves_credentials_and_old_records_remain_readable() {
+    fn rename_preserves_credentials_and_record_permissions() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_owned();
         handle_at(Request::List, root.clone(), root.clone()).unwrap();
         let id = "c".repeat(32);
-        let file = root.join("conns").join(format!("{id}.json"));
+        let file = root.join("server.json");
         let original = serde_json::json!({"id":id,"path":"/project", "pid":std::process::id(),
-            "start":identity(std::process::id()).unwrap(), "port":1234,"direct":true,
+            "start":identity(std::process::id()).unwrap(), "port":1234,
             "token":"keep-token", "certificate":"keep-cert", "log":"log", "created":17});
         fs::write(&file, original.to_string()).unwrap();
-        let old: Connection = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
-        assert!(!old.favorite);
-        assert_eq!(old.last_used, 0);
-        handle_at(
-            Request::Favorite {
-                id: id.clone(),
-                favorite: true,
-            },
-            root.clone(),
-            root.clone(),
-        )
-        .unwrap();
-        let visited = handle_at(
-            Request::Visit { id: id.clone() },
-            root.clone(),
-            root.clone(),
-        )
-        .unwrap();
-        assert!(visited[0].favorite);
-        assert!(visited[0].last_used > 0);
-        let mut other = old.clone();
-        other.id = "d".repeat(32);
-        other.path = "/aaa".into();
-        let other_file = root.join("conns").join(format!("{}.json", other.id));
-        fs::write(&other_file, serde_json::to_vec(&other).unwrap()).unwrap();
-        assert_eq!(
-            handle_at(Request::List, root.clone(), root.clone()).unwrap()[0].id,
-            id
-        );
-        handle_at(
-            Request::Favorite {
-                id: id.clone(),
-                favorite: false,
-            },
-            root.clone(),
-            root.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            handle_at(Request::List, root.clone(), root.clone()).unwrap()[0].id,
-            other.id
-        );
-        handle_at(
-            Request::Favorite {
-                id: id.clone(),
-                favorite: true,
-            },
-            root.clone(),
-            root.clone(),
-        )
-        .unwrap();
-        fs::remove_file(other_file).unwrap();
         for (name, expected) in [("  café  ", Some("café")), ("", None)] {
             let rows = handle_at(
                 Request::Rename {
@@ -620,8 +679,6 @@ mod tests {
             assert_eq!(saved["token"], "keep-token");
             assert_eq!(saved["certificate"], "keep-cert");
             assert_eq!(saved["created"], 17);
-            assert_eq!(saved["favorite"], true);
-            assert_eq!(saved["last_used"], visited[0].last_used);
             assert_eq!(
                 fs::metadata(&file).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -689,7 +746,7 @@ mod tests {
         assert!(browse("/").unwrap().parent.is_none());
     }
     #[test]
-    fn stale_pid_is_not_listed_or_signaled() {
+    fn stale_pid_is_not_signaled_and_wrong_server_id_preserves_record() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_owned();
         let home = root.clone();
@@ -697,51 +754,42 @@ mod tests {
         let c = Connection {
             id: "a".repeat(32),
             name: None,
-            favorite: false,
-            last_used: 0,
             path: "/test".into(),
             pid: std::process::id(),
             start: "wrong-start-time".into(),
             port: 1234,
-            direct: false,
+            socket: None,
             token: None,
             certificate: None,
             log: "log".into(),
             created: 0,
         };
-        fs::write(
-            root.join("conns").join(format!("{}.json", c.id)),
-            serde_json::to_vec(&c).unwrap(),
-        )
-        .unwrap();
+        fs::write(root.join("server.json"), serde_json::to_vec(&c).unwrap()).unwrap();
         assert!(
             handle_at(Request::List, root.clone(), home.clone())
                 .unwrap()
                 .is_empty()
         );
+        let record = fs::read(root.join("server.json")).unwrap();
+        assert!(
+            handle_at(
+                Request::Stop { id: "b".repeat(32) },
+                root.clone(),
+                home.clone()
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(root.join("server.json")).unwrap(), record);
         handle_at(Request::Stop { id: c.id }, root, home).unwrap();
         assert!(identity(std::process::id()).is_some());
     }
     #[test]
-    fn rejects_path_traversal_and_missing_project() {
+    fn rejects_path_traversal() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
             handle_at(
                 Request::Stop {
                     id: "../outside".into()
-                },
-                dir.path().into(),
-                dir.path().into()
-            )
-            .is_err()
-        );
-        assert!(
-            handle_at(
-                Request::Start {
-                    path: dir.path().join("missing").to_string_lossy().into(),
-                    direct: false,
-                    server_name: None,
-                    name: None,
                 },
                 dir.path().into(),
                 dir.path().into()

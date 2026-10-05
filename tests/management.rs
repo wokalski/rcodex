@@ -18,8 +18,10 @@ fn every_operation_requires_local_codex_before_ssh() {
     for flags in [
         vec!["--list"],
         vec!["/project", "--detach"],
-        vec!["--attach", "test"],
+        vec!["--resume", "test"],
         vec!["--reconnect"],
+        vec!["--inspect", "test"],
+        vec!["--shell", "test"],
         vec!["--logs", "abcd"],
         vec!["--stop", "abcd", "--yes"],
         vec!["--rename", "abcd", "--name", "new"],
@@ -48,7 +50,7 @@ fn management_uses_exact_ids_keeps_json_private_and_requires_stop_confirmation()
     executable(
         dir.path(),
         "ssh",
-        r#"#!/bin/sh
+        r###"#!/bin/sh
 for arg do last=$arg; done
 case "$last" in
   *'codex login status') printf 'login\n' >> "$TEST_DIR/events"; exit 0;;
@@ -60,24 +62,35 @@ case "$last" in
       *) printf '%s\n' "$ROWS";;
     esac;;
   *' __logs '*) printf '%s\n' "$last" >> "$TEST_DIR/events"; printf '%s\n' '{"Ok":"last two\nlines"}';;
+  *' __git '*) printf '%s\n' "$last" >> "$TEST_DIR/events"; printf '%s\n' '{"Ok":"## topic\n M file.rs"}';;
+  *' __snapshot '*) printf '%s\n' "$last" >> "$TEST_DIR/events"; printf '%s\n' "$SNAPSHOT";;
+  *' __thread_read '*) printf '%s\n' "$last" >> "$TEST_DIR/events"; printf '%s\n' "$CONVERSATION";;
+  'cd -- '*) printf '%s\n' "$last" >> "$TEST_DIR/events";;
   *) exit 0;;
 esac
-"#,
+"###,
     );
     let id = "a".repeat(32);
     let row = json!({"id":id,"name":"nightly","path":"/project with spaces","pid":42,
-        "start":"private-start","port":1234,"direct":true,"token":"SECRET_TOKEN",
+        "start":"private-start","port":1234,"token":"SECRET_TOKEN",
         "certificate":"SECRET_CERT","log":"/log","created":12});
+    let conversation = json!({"id":"saved-id","title":"older activity, newer visit","cwd":"/conversation/project","created_at":1,"updated_at":2,"status":"idle"});
+    let mut newer = conversation.clone();
+    newer["id"] = json!("newer-id");
+    newer["updated_at"] = json!(9000);
     let run = |flags: &[&str]| {
         fs::write(dir.path().join("events"), "").unwrap();
         let mut row = row.clone();
-        if flags.contains(&"--reconnect") {
+        if flags.contains(&"--reconnect")
+            || flags.contains(&"--resume")
+            || flags.contains(&"--last")
+        {
             row["certificate"] = Value::Null;
-            row["last_used"] = json!(42);
         }
         Command::new(env!("CARGO_BIN_EXE_rcodex"))
             .env("PATH", dir.path())
             .env("TEST_DIR", dir.path())
+            .env("RCODEX_HISTORY_FILE", dir.path().join("history.json"))
             .env(
                 "REMOTE_ARCH",
                 if cfg!(target_os = "macos") {
@@ -87,6 +100,8 @@ esac
                 },
             )
             .env("ROWS", json!({"rows":[row],"error":null}).to_string())
+            .env("CONVERSATION", json!({"Ok":conversation}).to_string())
+            .env("SNAPSHOT", json!({"Ok":{"sessions":[conversation,newer],"server_running":true,"complete":true,"warnings":[]}}).to_string())
             .arg("test-host")
             .args(flags)
             .output()
@@ -142,14 +157,27 @@ esac
             .unwrap()
             .contains("\"action\":\"list\"")
     );
+    let output = run(&["--inspect", "nightly"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("## topic\n M file.rs"));
+    assert!(!text.contains("SECRET"));
+    assert!(
+        !fs::read_to_string(dir.path().join("events"))
+            .unwrap()
+            .contains("login")
+    );
+    assert!(run(&["--shell", "nightly"]).status.success());
+    let events = fs::read_to_string(dir.path().join("events")).unwrap();
+    assert!(events.contains("cd -- '/project with spaces' && exec"));
+    assert!(!events.contains("login"));
+    assert!(!events.contains("\"action\":\"start\""));
     assert!(!dir.path().join("codex-args").exists());
+    fs::write(dir.path().join("history.json"), json!({"hosts":["test-host"],"sessions":[{"host":"test-host","conversation":conversation,"visited":50}]}).to_string()).unwrap();
     for (flags, prefix) in [
-        (vec!["--reconnect"], "resume\n--last\n"),
-        (vec!["--reconnect", "--resume"], "resume\n--remote\n"),
-        (
-            vec!["--reconnect", "--resume", "saved-id"],
-            "resume\nsaved-id\n",
-        ),
+        (vec!["--reconnect"], "resume\nsaved-id\n"),
+        (vec!["--resume", "saved-id"], "resume\nsaved-id\n"),
+        (vec!["--last"], "resume\nnewer-id\n"),
     ] {
         let output = run(&flags);
         assert!(
@@ -159,10 +187,19 @@ esac
         );
         let args = fs::read_to_string(dir.path().join("codex-args")).unwrap();
         assert!(args.starts_with(prefix), "{args}");
-        assert!(args.contains("--cd\n/project with spaces\n"));
+        assert!(args.contains("--cd\n/conversation/project\n"));
         let events = fs::read_to_string(dir.path().join("events")).unwrap();
-        assert!(events.contains("\"action\":\"visit\""));
-        assert!(events.contains(&format!("\"id\":\"{id}\"")));
+        assert!(events.contains("\"action\":\"ensure\""));
         assert!(!events.contains("\"action\":\"start\""));
+        if !flags.contains(&"--last") {
+            assert!(events.contains("__thread_read"));
+            assert!(!events.contains("__snapshot"));
+        }
     }
+    let history: Value =
+        serde_json::from_slice(&fs::read(dir.path().join("history.json")).unwrap()).unwrap();
+    assert_eq!(history["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(history["sessions"][0]["conversation"]["id"], "newer-id");
+    assert_eq!(history["sessions"][0]["host"], "test-host");
+    assert!(!history.to_string().contains("SECRET"));
 }

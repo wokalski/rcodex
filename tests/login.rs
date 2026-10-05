@@ -50,6 +50,7 @@ esac
         let output = Command::new(env!("CARGO_BIN_EXE_rcodex"))
             .env("PATH", dir.path())
             .env("TEST_DIR", dir.path())
+            .env("RCODEX_HISTORY_FILE", dir.path().join("history.json"))
             .env("SCENARIO", scenario)
             .args(["test-host", "/project"])
             .output()
