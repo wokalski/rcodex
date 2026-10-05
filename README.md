@@ -24,6 +24,8 @@ rcodex devbox '~/projects/my-app'
 | c | Continue the latest conversation in that server's project |
 | s | Open Codex's remote conversation picker |
 | / | Search servers by name, path, or ID; Enter applies, Esc clears |
+| f / Shift+F | Star selected server / show only favorites |
+| ? / F1 | Keyboard guide (? in workspace list, F1 anywhere); arrows scroll |
 | e | Rename selected server; empty name restores the folder label |
 | l | Open server logs, with follow/pause and scrolling |
 | n | Browse remote folders for a new project |
@@ -42,6 +44,8 @@ followed; hidden folders appear after ordinary folders.
 
 Rows show the server name, short ID, transport, and uptime. Refresh preserves the
 selected server by ID. Stop confirmation captures that ID, not its row number.
+Starred servers appear first and are saved on the remote host, so favorites work
+across clients. Favorites filtering and text search can be combined.
 
 The log viewer refreshes every 2 seconds. **f** toggles following; **↑/↓** and
 **PageUp/PageDown** scroll; **←/→** pan long lines; **Home** goes to the top;
@@ -90,6 +94,7 @@ characters are removed before display.
 ## Resume a conversation
 
 ```sh
+rcodex devbox --reconnect          # last opened running server + its latest conversation
 rcodex devbox --resume             # select a server, then a remote conversation
 rcodex devbox --resume SESSION_ID  # select a server, then resume this conversation
 rcodex devbox --last               # select a server, then resume its project's latest conversation
@@ -97,6 +102,11 @@ rcodex devbox --direct --resume    # also works with direct WebSockets
 ```
 
 Choose the existing server from the workspace list to rejoin a live conversation.
+`--reconnect` skips the workspace picker. It uses the last connection timestamp
+recorded on that host (shared across clients), not server creation time. If no
+previously opened server remains running, it reports that instead of creating one.
+Detached starts do not count as visits. Add `--resume` to pick a conversation
+instead of continuing the latest; add `--direct` for direct TLS transport.
 Resume uses Codex's remote session picker and remote history, not your laptop's
 session files. A conversation active in another app-server may be read-only:
 connect to its owning server to continue it. Supplying a project path or choosing

@@ -72,6 +72,9 @@ struct App {
     log_scroll: u16,
     log_x: u16,
     log_follow: bool,
+    help: bool,
+    help_scroll: u16,
+    favorites_only: bool,
 }
 impl App {
     fn visible_rows(&self) -> Vec<&Connection> {
@@ -79,9 +82,10 @@ impl App {
         self.rows
             .iter()
             .filter(|r| {
-                format!("{} {} {}", r.label(), r.path, r.id)
-                    .to_lowercase()
-                    .contains(&query)
+                (!self.favorites_only || r.favorite)
+                    && format!("{} {} {}", r.label(), r.path, r.id)
+                        .to_lowercase()
+                        .contains(&query)
             })
             .collect()
     }
@@ -117,6 +121,22 @@ impl App {
     fn key(&mut self, key: KeyEvent, direct: bool) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
+        }
+        if self.help {
+            match key.code {
+                KeyCode::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                KeyCode::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                KeyCode::Home => self.help_scroll = 0,
+                _ => self.help = false,
+            }
+            return Action::Nothing;
+        }
+        if key.code == KeyCode::F(1)
+            || (matches!(self.mode, Mode::Browse) && key.code == KeyCode::Char('?'))
+        {
+            self.help = true;
+            self.help_scroll = 0;
+            return Action::Nothing;
         }
         if self.busy {
             return Action::Nothing;
@@ -246,6 +266,18 @@ impl App {
                 }
             },
             Mode::Browse => match key.code {
+                KeyCode::Char('f') => {
+                    if let Some(c) = selected {
+                        return Action::Remote(Request::Favorite {
+                            id: c.id,
+                            favorite: !c.favorite,
+                        });
+                    }
+                }
+                KeyCode::Char('F') => {
+                    self.favorites_only = !self.favorites_only;
+                    self.list.select(Some(0));
+                }
                 KeyCode::Esc if !self.search.value().is_empty() => {
                     self.search = Input::default();
                     self.list.select(Some(0));
@@ -320,6 +352,43 @@ impl App {
         Action::Nothing
     }
     fn draw(&mut self, f: &mut Frame, host: &str, direct: bool) {
+        self.draw_content(f, host, direct);
+        if self.help {
+            let area = popup(f.area(), 86, 24);
+            f.render_widget(Clear, area);
+            f.render_widget(
+                Paragraph::new(concat!(
+                    "WORKSPACES\n",
+                    "↑↓ / j k    Select         enter    New conversation\n",
+                    "c           Continue      s        Conversation picker\n",
+                    "/           Search        esc      Clear search / quit\n",
+                    "f           Star/unstar   F        Favorites only\n",
+                    "e           Rename        l        Live server logs\n",
+                    "n           New project   b        Browse selected project\n",
+                    "X / Q       Stop (asks)   r        Refresh\n\n",
+                    "FOLDER BROWSER\n",
+                    "enter / →   Open folder   ←        Parent folder\n",
+                    "space       Launch here   ctrl+n   Create folder\n",
+                    "home        Home folder   typing   Filter folders\n\n",
+                    "LOGS\n",
+                    "↑↓ / pgup / pgdn scroll   ←→ pan   f follow/pause\n",
+                    "home top    end follow    esc back\n\n",
+                    "F1 help · ↑↓ scroll · home top · any other key closes"
+                ))
+                .wrap(Wrap { trim: false })
+                .scroll((self.help_scroll, 0))
+                .block(
+                    Block::bordered()
+                        .title(" KEYBOARD GUIDE ")
+                        .padding(Padding::uniform(1))
+                        .border_style(Style::default().fg(ACCENT)),
+                )
+                .style(Style::default().bg(BG).fg(FG)),
+                area,
+            );
+        }
+    }
+    fn draw_content(&mut self, f: &mut Frame, host: &str, direct: bool) {
         f.render_widget(Block::new().style(Style::default().bg(BG).fg(FG)), f.area());
         let area = f.area().inner(Margin {
             horizontal: 3,
@@ -478,7 +547,10 @@ impl App {
                 };
                 ListItem::new(vec![
                     Line::from(vec![
-                        Span::styled(" ● ", Style::default().fg(ACCENT)),
+                        Span::styled(
+                            if r.favorite { " ★ " } else { " ● " },
+                            Style::default().fg(ACCENT),
+                        ),
                         Span::raw(r.label().to_owned()).bold(),
                         Span::styled(
                             format!(
@@ -505,7 +577,12 @@ impl App {
                     .borders(Borders::TOP)
                     .border_style(Style::default().fg(SELECT))
                     .title(format!(
-                        " WORKSPACES  {} / {} ",
+                        " {}  {} / {} ",
+                        if self.favorites_only {
+                            "FAVORITES"
+                        } else {
+                            "WORKSPACES"
+                        },
                         self.visible_rows().len(),
                         self.rows.len()
                     ))
@@ -536,7 +613,7 @@ impl App {
             );
         }
         f.render_widget(
-            Paragraph::new("↑↓ select   enter new chat   c continue   s sessions   / search\nn new project   b browse   e rename   l logs   X/Q stop   r refresh   q quit")
+            Paragraph::new("↑↓ select   enter new chat   c continue   s sessions   / search   ? help\nf star   F favorites   n new   b browse   e rename   l logs   X/Q stop   q quit")
                 .fg(MUTED)
                 .wrap(Wrap { trim: false }),
             footer,
@@ -652,7 +729,10 @@ fn dispatch(client: Client, action: Action) -> Receiver<Result<Loaded>> {
             return;
         };
         let start = matches!(request, Request::Start { .. });
-        let refresh = matches!(request, Request::Stop { .. } | Request::Rename { .. });
+        let refresh = matches!(
+            request,
+            Request::Stop { .. } | Request::Rename { .. } | Request::Favorite { .. }
+        );
         let result = client.call(request).and_then(|rows| {
             if refresh {
                 client.call(Request::List)
@@ -715,7 +795,7 @@ pub fn pick(client: Client, direct: bool) -> Result<Option<(Connection, Open)>> 
                             }
                         }
                     }
-                    Event::Paste(text) if !app.busy => {
+                    Event::Paste(text) if !app.busy && !app.help => {
                         let event =
                             Event::Paste(text.chars().filter(|c| !c.is_control()).collect());
                         match app.mode {
@@ -772,6 +852,8 @@ mod tests {
                 Connection {
                     id: "a".repeat(32),
                     name: None,
+                    favorite: false,
+                    last_used: 0,
                     path: "/home/dev/projects/example-app".into(),
                     pid: 123,
                     start: "123".into(),
@@ -785,6 +867,8 @@ mod tests {
                 Connection {
                     id: "b".repeat(32),
                     name: Some("Overnight refactor".into()),
+                    favorite: true,
+                    last_used: 0,
                     path: "/home/dev/projects/rcodex".into(),
                     pid: 456,
                     start: "456".into(),
@@ -801,6 +885,34 @@ mod tests {
         app.list.select(Some(0));
         app
     }
+    #[test]
+    fn favorites_filter_actions_and_help_do_not_target_hidden_rows() {
+        let mut app = fixture();
+        app.key(KeyCode::Char('F').into(), false);
+        assert_eq!(app.visible_rows().len(), 1);
+        assert!(
+            matches!(app.key(KeyCode::Char('f').into(), false), Action::Remote(Request::Favorite { id, favorite: false }) if id == "b".repeat(32))
+        );
+        app.key(KeyCode::Char('?').into(), false);
+        assert!(app.help);
+        assert!(matches!(
+            app.key(KeyCode::Char('X').into(), false),
+            Action::Nothing
+        ));
+        assert!(!app.help);
+        assert!(matches!(app.mode, Mode::Browse));
+        app.search = Input::new("example".into());
+        assert!(app.visible_rows().is_empty());
+        assert!(matches!(
+            app.key(KeyCode::Char('f').into(), false),
+            Action::Nothing
+        ));
+        app.mode = Mode::New;
+        app.key(KeyCode::F(1).into(), false);
+        app.key(KeyCode::Esc.into(), false);
+        assert!(matches!(app.mode, Mode::New));
+    }
+
     #[test]
     fn uppercase_kills_lowercase_quits_and_cancel_preserves_server() {
         for key in ['X', 'Q'] {
@@ -987,6 +1099,8 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend};
         for (name, mode) in [
             ("workspaces", Mode::Browse),
+            ("help", Mode::Browse),
+            ("favorites", Mode::Browse),
             ("new-project", Mode::New),
             ("browser-empty", Mode::New),
             ("browser-error", Mode::New),
@@ -998,6 +1112,8 @@ mod tests {
         ] {
             let mut app = fixture();
             app.mode = mode;
+            app.help = name == "help";
+            app.favorites_only = name == "favorites";
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -1042,11 +1158,13 @@ mod tests {
                 .map(|y| (0..96).map(|x| buffer[(x, y)].symbol()).collect::<String>())
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(text.contains("RCODEX"));
+            assert!(name == "help" || text.contains("RCODEX"));
             assert!(text.contains(match name {
                 "new-project" | "browser-empty" | "browser-error" => "space launch",
                 "stop-server" => "y stop server   any other key cancel",
                 "search" => "Overnight refactor",
+                "help" => "KEYBOARD GUIDE",
+                "favorites" => "FAVORITES",
                 "rename" => "RENAME SERVER",
                 "create-folder" => "NEW FOLDER",
                 "logs" => "Thread resumed successfully",

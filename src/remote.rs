@@ -25,6 +25,10 @@ pub struct Connection {
     pub id: String,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub last_used: u64,
     pub path: String,
     pub pid: u32,
     pub start: String,
@@ -54,6 +58,13 @@ pub enum Request {
     Rename {
         id: String,
         name: String,
+    },
+    Favorite {
+        id: String,
+        favorite: bool,
+    },
+    Visit {
+        id: String,
     },
 }
 #[derive(Serialize, Deserialize)]
@@ -284,20 +295,29 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
                 }
             }
             rows.sort_by(|a, b| {
-                a.path
-                    .cmp(&b.path)
+                b.favorite
+                    .cmp(&a.favorite)
+                    .then(a.path.cmp(&b.path))
                     .then(a.created.cmp(&b.created))
                     .then(a.id.cmp(&b.id))
             });
             Ok(rows)
         }
-        Request::Rename { id, name } => {
-            validate_id(&id)?;
-            let name = normalized_name(&name)?;
+        Request::Rename { ref id, .. }
+        | Request::Favorite { ref id, .. }
+        | Request::Visit { ref id } => {
+            validate_id(id)?;
             let file = conns.join(format!("{id}.json"));
             let mut c: Connection = serde_json::from_slice(&fs::read(&file)?)?;
             ensure!(c.active(), "server is no longer running");
-            c.name = name;
+            match request {
+                Request::Rename { name, .. } => c.name = normalized_name(&name)?,
+                Request::Favorite { favorite, .. } => c.favorite = favorite,
+                Request::Visit { .. } => {
+                    c.last_used = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64
+                }
+                _ => unreachable!(),
+            }
             let mut temp = tempfile::NamedTempFile::new_in(&conns)?;
             temp.write_all(&serde_json::to_vec(&c)?)?;
             temp.persist(&file)?;
@@ -408,6 +428,8 @@ fn handle_at(request: Request, root: PathBuf, home: PathBuf) -> Result<Vec<Conne
                 let c = Connection {
                     id: id.clone(),
                     name,
+                    favorite: false,
+                    last_used: 0,
                     path: path.to_string_lossy().into(),
                     pid: child.id(),
                     start: identity(child.id()).unwrap_or_default(),
@@ -530,6 +552,58 @@ mod tests {
             "start":identity(std::process::id()).unwrap(), "port":1234,"direct":true,
             "token":"keep-token", "certificate":"keep-cert", "log":"log", "created":17});
         fs::write(&file, original.to_string()).unwrap();
+        let old: Connection = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert!(!old.favorite);
+        assert_eq!(old.last_used, 0);
+        handle_at(
+            Request::Favorite {
+                id: id.clone(),
+                favorite: true,
+            },
+            root.clone(),
+            root.clone(),
+        )
+        .unwrap();
+        let visited = handle_at(
+            Request::Visit { id: id.clone() },
+            root.clone(),
+            root.clone(),
+        )
+        .unwrap();
+        assert!(visited[0].favorite);
+        assert!(visited[0].last_used > 0);
+        let mut other = old.clone();
+        other.id = "d".repeat(32);
+        other.path = "/aaa".into();
+        let other_file = root.join("conns").join(format!("{}.json", other.id));
+        fs::write(&other_file, serde_json::to_vec(&other).unwrap()).unwrap();
+        assert_eq!(
+            handle_at(Request::List, root.clone(), root.clone()).unwrap()[0].id,
+            id
+        );
+        handle_at(
+            Request::Favorite {
+                id: id.clone(),
+                favorite: false,
+            },
+            root.clone(),
+            root.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            handle_at(Request::List, root.clone(), root.clone()).unwrap()[0].id,
+            other.id
+        );
+        handle_at(
+            Request::Favorite {
+                id: id.clone(),
+                favorite: true,
+            },
+            root.clone(),
+            root.clone(),
+        )
+        .unwrap();
+        fs::remove_file(other_file).unwrap();
         for (name, expected) in [("  café  ", Some("café")), ("", None)] {
             let rows = handle_at(
                 Request::Rename {
@@ -546,6 +620,8 @@ mod tests {
             assert_eq!(saved["token"], "keep-token");
             assert_eq!(saved["certificate"], "keep-cert");
             assert_eq!(saved["created"], 17);
+            assert_eq!(saved["favorite"], true);
+            assert_eq!(saved["last_used"], visited[0].last_used);
             assert_eq!(
                 fs::metadata(&file).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -621,6 +697,8 @@ mod tests {
         let c = Connection {
             id: "a".repeat(32),
             name: None,
+            favorite: false,
+            last_used: 0,
             path: "/test".into(),
             pid: std::process::id(),
             start: "wrong-start-time".into(),

@@ -19,6 +19,7 @@ fn every_operation_requires_local_codex_before_ssh() {
         vec!["--list"],
         vec!["/project", "--detach"],
         vec!["--attach", "test"],
+        vec!["--reconnect"],
         vec!["--logs", "abcd"],
         vec!["--stop", "abcd", "--yes"],
         vec!["--rename", "abcd", "--name", "new"],
@@ -42,7 +43,7 @@ fn management_uses_exact_ids_keeps_json_private_and_requires_stop_confirmation()
     executable(
         dir.path(),
         "codex",
-        "#!/bin/sh\ntest \"$1\" = --version || exit 91\n",
+        "#!/bin/sh\ntest \"$1\" = --version && exit 0\nprintf '%s\\n' \"$@\" > \"$TEST_DIR/codex-args\"\n",
     );
     executable(
         dir.path(),
@@ -69,6 +70,11 @@ esac
         "certificate":"SECRET_CERT","log":"/log","created":12});
     let run = |flags: &[&str]| {
         fs::write(dir.path().join("events"), "").unwrap();
+        let mut row = row.clone();
+        if flags.contains(&"--reconnect") {
+            row["certificate"] = Value::Null;
+            row["last_used"] = json!(42);
+        }
         Command::new(env!("CARGO_BIN_EXE_rcodex"))
             .env("PATH", dir.path())
             .env("TEST_DIR", dir.path())
@@ -136,4 +142,27 @@ esac
             .unwrap()
             .contains("\"action\":\"list\"")
     );
+    assert!(!dir.path().join("codex-args").exists());
+    for (flags, prefix) in [
+        (vec!["--reconnect"], "resume\n--last\n"),
+        (vec!["--reconnect", "--resume"], "resume\n--remote\n"),
+        (
+            vec!["--reconnect", "--resume", "saved-id"],
+            "resume\nsaved-id\n",
+        ),
+    ] {
+        let output = run(&flags);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let args = fs::read_to_string(dir.path().join("codex-args")).unwrap();
+        assert!(args.starts_with(prefix), "{args}");
+        assert!(args.contains("--cd\n/project with spaces\n"));
+        let events = fs::read_to_string(dir.path().join("events")).unwrap();
+        assert!(events.contains("\"action\":\"visit\""));
+        assert!(events.contains(&format!("\"id\":\"{id}\"")));
+        assert!(!events.contains("\"action\":\"start\""));
+    }
 }

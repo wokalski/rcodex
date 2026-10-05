@@ -81,6 +81,13 @@ fn real_codex_persists_lists_authenticates_and_stops() {
                 path
             );
             assert_eq!(call(&root, json!({"action":"list"}))[0]["id"], id);
+            call(&root, json!({"action":"favorite","id":id,"favorite":true}));
+            call(&root, json!({"action":"visit","id":id}));
+            let saved = call(&root, json!({"action":"list"}));
+            assert_eq!(saved[0]["favorite"], true);
+            assert!(saved[0]["last_used"].as_u64().unwrap() > 0);
+            assert_eq!(saved[0]["token"], c["token"]);
+            assert_eq!(saved[0]["certificate"], c["certificate"]);
             let metadata = fs::metadata(root.join("conns").join(format!("{id}.json"))).unwrap();
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
             let certificate = c["certificate"].as_str();

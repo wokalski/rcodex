@@ -37,6 +37,9 @@ struct Args {
     /// Attach by server name, exact path, or unique ID prefix (at least 4 characters)
     #[arg(long, group = "target", value_name = "SERVER")]
     attach: Option<String>,
+    /// Return to the last opened running server and continue its latest conversation
+    #[arg(long, group = "target")]
+    reconnect: bool,
     /// Show the tail of a server's log
     #[arg(long, group = "target", value_name = "SERVER")]
     logs: Option<String>,
@@ -155,6 +158,7 @@ fn run() -> Result<()> {
     if !args.management()
         && args.path.is_none()
         && args.attach.is_none()
+        && !args.reconnect
         && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal())
     {
         bail!("the workspace picker needs a terminal; provide a remote path instead");
@@ -208,6 +212,8 @@ fn run() -> Result<()> {
             .into_iter()
             .next()
             .map(|c| (c, ui::Open::New))
+    } else if args.reconnect {
+        Some((recent(client.call(remote::Request::List)?)?, ui::Open::Last))
     } else if let Some(selector) = args.attach {
         Some((
             select(client.call(remote::Request::List)?, &selector)?,
@@ -224,6 +230,9 @@ fn run() -> Result<()> {
         return Ok(());
     }
     let endpoint = client.endpoint(&selected, args.direct)?;
+    client.call(remote::Request::Visit {
+        id: selected.id.clone(),
+    })?;
     let resume = args
         .resume
         .as_deref()
@@ -236,6 +245,13 @@ fn run() -> Result<()> {
         command.env("SSL_CERT_FILE", roots);
     }
     Err(command.exec()).context("launch local Codex")
+}
+
+fn recent(rows: Vec<remote::Connection>) -> Result<remote::Connection> {
+    rows.into_iter()
+        .filter(|c| c.last_used > 0)
+        .max_by(|a, b| a.last_used.cmp(&b.last_used).then(a.id.cmp(&b.id)))
+        .context("no previously opened server is still running; open the workspace picker first")
 }
 
 fn select(rows: Vec<remote::Connection>, selector: &str) -> Result<remote::Connection> {
@@ -261,6 +277,7 @@ fn public_server(c: &remote::Connection) -> serde_json::Value {
     // Deliberate allowlist: never serialize the remote protocol record to stdout.
     serde_json::json!({"id": c.id, "name": c.name, "path": c.path, "pid": c.pid,
         "port": c.port, "created": c.created, "log": c.log,
+        "favorite": c.favorite, "last_used": c.last_used,
         "transport": if c.certificate.is_some() { "tls" } else if c.direct { "legacy-direct" } else { "ssh" }})
 }
 
@@ -374,6 +391,8 @@ mod tests {
         remote::Connection {
             id: id.into(),
             name: Some(name.into()),
+            favorite: false,
+            last_used: 0,
             path: path.into(),
             pid: 1,
             start: "private-start".into(),
@@ -384,6 +403,21 @@ mod tests {
             log: "/logs/server.log".into(),
             created: 100,
         }
+    }
+
+    #[test]
+    fn reconnect_uses_visit_time_not_creation_or_favorites() {
+        let mut a = connection("a", "old", "/a");
+        let mut b = connection("b", "new", "/b");
+        assert!(recent(vec![a.clone(), b.clone()]).is_err());
+        a.last_used = 20;
+        b.last_used = 10;
+        b.created = 900;
+        b.favorite = true;
+        assert_eq!(recent(vec![a.clone(), b.clone()]).unwrap().id, "a");
+        assert_eq!(recent(vec![b, a]).unwrap().id, "a");
+        assert!(recent(vec![]).is_err());
+        assert!(Args::try_parse_from(["rcodex", "host", "--reconnect", "/project"]).is_err());
     }
 
     #[test]
@@ -454,6 +488,8 @@ mod tests {
         let connection = remote::Connection {
             id: "connection".into(),
             name: None,
+            favorite: false,
+            last_used: 0,
             path: "/remote/project with spaces".into(),
             pid: 1,
             start: "start".into(),
